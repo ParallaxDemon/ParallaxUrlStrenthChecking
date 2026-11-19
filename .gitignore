@@ -1,0 +1,23 @@
+# Android build output
+/build
+/app/build
+.gradle/
+local.properties
+*.apk
+*.ap_
+*.dex
+
+# C/C++ intermediate files
+.cxx/
+/app/src/main/obj/
+*.o
+*.o.d
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
