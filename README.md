@@ -1,107 +1,149 @@
-# ParallaxUrlStrengthChecking 🚀
+# ParallaxUrlStrengthChecking 🚀 (Maximum Edition)
 
-> **Ultra Runtime URL Redirection & Dynamic Curl Hook Engine for Android Native Libraries**  
-> Developed with ❤️ by **[ParallaxDemon](https://github.com/ParallaxDemon)**
+> **Ultra Runtime URL Redirection & Multi-Layer Hooking Engine for Android Native Libraries**  
+> Developed with ❤️ by **[ParallaxDemon](https://github.com/ParallaxDemon)**  
+> Integrated with **[Dobby Hook](https://github.com/jmpews/Dobby)** & **[And64InlineHook](https://github.com/Rprop/And64InlineHook)** (by Rprop)
 
 ---
 
 ## 🌟 Overview
 
-**ParallaxUrlStrengthChecking** is a high-performance native Android shared library (`liburlhook.so`) powered by the **Dobby Hook** framework and modern **C++17**.
+**ParallaxUrlStrengthChecking** is an all-in-one native Android hooking & memory patching library (`liburlhook.so`) engineered in modern **C++17**.
 
-It intercepts native `libcurl` network calls across target Android libraries (e.g., `libil2cpp.so`, `libanogs.so`, `libUE4.so`) and dynamically rewrites URLs, domains, and endpoints in real-time — **without modifying the game or target APK's original binary**.
+It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, and redirect URLs and domain names **under any circumstance** — whether the target application uses `libcurl`, modern `curl_url_set`, raw TCP sockets, or hardcoded string constants in stripped binaries.
 
 ---
 
-## ✨ Ultra-Level Features
+## 🛡️ 5-Layer Maximum Interception Architecture
 
-- 🎯 **Multi-Target Library Support**:
-  - Automatically identifies and hooks `libil2cpp.so` (Unity), `libanogs.so` (Anti-cheat), `libUE4.so` (Unreal Engine), `libcurl.so`, or any custom native library.
-  - Also resolves and hooks global curl symbols (`RTLD_DEFAULT`).
+```
+[Target App / Game]
+        │
+        ├──► [Layer 1: DNS Interception] ──────► Redirects hostname at OS libc level (getaddrinfo/gethostbyname)
+        │                                        (Redirects ANY native socket/HTTP client to new domain)
+        │
+        ├──► [Layer 2: cURL API Interception] ──► Hooks curl_easy_setopt (CURLOPT_URL) & curl_url_set
+        │                                        + Full SSL/TLS Pinning Bypass (Peer/Host/Status = 0)
+        │
+        ├──► [Layer 3: In-Memory Hot-Patcher] ──► Scans mapped memory pages (/proc/self/maps)
+        │                                        mprotect write-patching for hardcoded strings in RAM
+        │
+        ├──► [Layer 4: Dual Hooking Engines] ───► Hybrid Dobby + And64InlineHook (Rprop)
+        │                                        Auto-fallback + Direct RVA offset hooking support
+        │
+        └──► [Layer 5: Dynamic Storage Config] ─► Reads /sdcard/url_config.json on the fly
+                                                 Change URLs without recompiling the .so!
+```
 
-- ⚡ **Dynamic `dlopen` Interception & Background Watcher**:
-  - Hooks `dlopen` to instantly catch target libraries the millisecond they are loaded into memory.
-  - Features an asynchronous `/proc/self/maps` scanner thread as a fail-safe against custom linkers or packers. Zero race conditions!
+---
 
-- 🔄 **Ultra Multi-Rule URL Transformation Engine**:
-  - **`MatchType::EXACT`**: Replaces the entire URL string exactly.
-  - **`MatchType::DOMAIN`**: Replaces only the domain/host while preserving paths, parameters, and query strings.
-  - **`MatchType::PREFIX`**: Replaces URLs starting with a designated prefix.
-  - **`MatchType::CONTAINS`**: Replaces all occurrences of a designated substring.
-  - **`MatchType::REGEX`**: Advanced pattern matching and regex substitution.
+## ✨ Features Breakdown
 
-- 🛡️ **Crash-Proof Memory Lifecycle Management**:
-  - Naive hookers that `free()` modified strings inside `curl_easy_setopt` cause immediate `SIGSEGV` / heap corruption crashes during `curl_easy_perform`.
-  - This engine features a thread-safe handle allocation tracker (`std::unordered_map<void*, std::vector<char*>>`) that guarantees strings remain valid throughout the request lifecycle and are safely freed during `curl_easy_cleanup()`.
+### 1. Dual Hooking Engines (Dobby + And64InlineHook Hybrid)
+- **Primary:** High-speed Dobby inline hooker.
+- **Fallback:** [And64InlineHook](https://github.com/Rprop/And64InlineHook) (by Rprop). If Dobby encounters instruction relocation issues or PAC on ARM64, the engine automatically falls back to `A64HookFunction`.
+- **RVA Offset Hooking:** Easily hook stripped/unexported functions directly by memory offset:
+  ```cpp
+  HookByRVA("libil2cpp.so", 0x1A2B3C, (void*)my_hook, (void**)&orig_func, "internal_func");
+  ```
 
-- 🔓 **Full SSL / TLS Verification Override**:
-  - Automatically forces `CURLOPT_SSL_VERIFYPEER = 0`, `CURLOPT_SSL_VERIFYHOST = 0`, and `CURLOPT_SSL_VERIFYSTATUS = 0`.
-  - Fixes `curl` Error 60 (`CURLE_PEER_FAILED_VERIFICATION`) and allows seamless routing to custom self-signed endpoints or proxies.
-  - Optional automatic `http://` to `https://` protocol upgrades.
+### 2. DNS-Level Interception (`getaddrinfo` / `gethostbyname`)
+- Intercepts DNS queries in `libc.so`.
+- When an application tries to resolve `teamruthless.authapi.xyz`, it automatically resolves to `yourpanel.com` before the socket connection is created.
+- **Works even if cURL is completely stripped or custom sockets are used!**
 
-- 📊 **Detailed Logcat Diagnostics**:
-  - Real-time logging under the tag `URL_HOOK` showing execution time, handle addresses, original URLs, and rewritten destinations.
+### 3. In-Memory String Scanner & Hot-Patcher (`mprotect`)
+- Scans all mapped memory pages (`.rodata`, `.data`) of target libraries (`libil2cpp.so`, etc.).
+- Finds byte occurrences of old URLs/domains and directly overwrites them in process memory.
+- Uses `mprotect(PROT_READ | PROT_WRITE)` + cache flush (`__builtin___clear_cache`).
+
+### 4. Crash-Proof Memory Lifecycle Tracking
+- Prevents use-after-free crashes (`SIGSEGV`) by maintaining a thread-safe map of allocated URL strings tied to their `CURL*` handle.
+- Memory is safely released only when `curl_easy_cleanup` is called.
+
+### 5. Full SSL / TLS Pinning Bypass
+- Automatically overrides:
+  - `CURLOPT_SSL_VERIFYPEER` (64) = 0
+  - `CURLOPT_SSL_VERIFYHOST` (81) = 0
+  - `CURLOPT_SSL_VERIFYSTATUS` (232) = 0
+  - Clears `CURLOPT_CAINFO` and `CURLOPT_CAPATH`.
+- Eliminates `curl error 60` (`CURLE_PEER_FAILED_VERIFICATION`) when redirecting to custom or self-signed servers.
+
+### 6. Dynamic Runtime Config (`/sdcard/url_config.json`)
+- Edit URLs at runtime without recompiling!
+- Simply place [`sample_url_config.json`](sample_url_config.json) at `/storage/emulated/0/url_config.json` (or `/sdcard/url_config.json`).
+- If the file is absent, the engine seamlessly uses built-in C++ rules.
 
 ---
 
 ## 🛠️ Configuration Guide
 
-All configuration is located in [`app/src/main/jni/Main.cpp`](app/src/main/jni/Main.cpp).
-
-### 1. Adding Redirection Rules
+### Built-in Rules (`app/src/main/jni/Main.cpp`)
 
 ```cpp
-static const std::vector<UrlRule> URL_RULES = {
-    // 1. Full URL exact match
+static std::vector<UrlRule> URL_RULES = {
+    // 1. Exact Full URL Replacement
     {
-        "https://api.oldserver.com/v1/auth",
-        "https://api.newserver.com/v1/auth",
+        "https://teamruthless.authapi.xyz/connect",
+        "https://yourpanel.com/connect",
         MatchType::EXACT,
         true,
         "Auth Endpoint"
     },
 
-    // 2. Domain replacement (keeps /path?query intact)
+    // 2. Domain Replacement (Preserves paths & queries)
     {
-        "oldserver.com",
-        "newserver.com",
+        "teamruthless.authapi.xyz",
+        "yourpanel.com",
         MatchType::DOMAIN,
         true,
         "Domain Swap"
     },
 
-    // 3. Substring replacement
+    // 3. Substring Swap
     {
-        "oldkeyword",
-        "newkeyword",
+        "authapi.xyz",
+        "yourpanel.com",
         MatchType::CONTAINS,
         true,
-        "Keyword Swap"
+        "Root Swap"
     }
 };
 ```
 
-### 2. Specifying Target Libraries
+### External Config (`/sdcard/url_config.json`)
 
-```cpp
-static const std::vector<std::string> TARGET_LIBS = {
-    "libil2cpp.so",    // Unity
-    "libanogs.so",     // Tencent / Anti-Cheat
-    "libUE4.so",       // Unreal Engine
-    "libcurl.so"       // Standard curl
-};
+```json
+{
+  "ssl_bypass": true,
+  "force_https": true,
+  "verbose_logs": true,
+  "rules": [
+    {
+      "pattern": "teamruthless.authapi.xyz",
+      "replacement": "yourpanel.com",
+      "type": "DOMAIN",
+      "tag": "Domain Swap"
+    }
+  ]
+}
 ```
 
 ---
 
 ## 🔨 Build Instructions
 
-### Method A: Direct Termux / Linux Build (ARM64)
+### Method A: Termux / Linux Build (ARM64)
 
 ```bash
+cd /data/user/0/com.termux/files/home/projects/ParallaxUrlStrenthChecking
+
 clang++ -std=c++17 -shared -fPIC -O2 \
   -I app/src/main/jni/Dobby \
+  -I app/src/main/jni/And64InlineHook \
+  -I app/src/main/jni \
   app/src/main/jni/Main.cpp \
+  app/src/main/jni/And64InlineHook/And64InlineHook.cpp \
   app/src/main/jni/Dobby/arm64-v8a/libdobby.a \
   -llog -ldl \
   -o app/src/main/jniLibs/arm64-v8a/liburlhook.so
@@ -116,29 +158,28 @@ cd app/src/main/jni
 ndk-build
 ```
 
-Compiled `.so` binaries will be output to `app/src/main/libs/` or `app/src/main/jniLibs/` for all architectures (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`).
-
 ---
 
 ## 📱 How to Inject & Run
 
 1. **Via `System.loadLibrary`**:
-   Load `liburlhook.so` before the target library in your app or mod menu:
    ```java
    System.loadLibrary("urlhook");
    ```
 
-2. **Via APK Injection (NP Manager / MT Manager)**:
-   - Add `liburlhook.so` to the APK's `lib/<arch>/` directory.
-   - Inject `System.loadLibrary("urlhook")` inside the `Application.onCreate()` or `MainActivity.onCreate()` Smali bytecode.
+2. **Via APK Injection (MT Manager / NP Manager)**:
+   - Copy `liburlhook.so` into `lib/arm64-v8a/` inside the APK.
+   - Inject `const-string v0, "urlhook"` -> `invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V` into `Application.onCreate()` or `MainActivity.onCreate()`.
 
-3. **Monitor Logs via Logcat**:
+3. **Monitor Real-Time Logs via Logcat**:
    ```bash
    adb logcat -s URL_HOOK
    ```
 
 ---
 
-## ⚖️ License & Disclaimer
+## ⚖️ Credits & License
 
-This project is created by **ParallaxDemon** for educational, security auditing, and API migration testing purposes.
+- **[Dobby](https://github.com/jmpews/Dobby)** by jmpews.
+- **[And64InlineHook](https://github.com/Rprop/And64InlineHook)** by Rprop.
+- Created and maintained by **[ParallaxDemon](https://github.com/ParallaxDemon)**.

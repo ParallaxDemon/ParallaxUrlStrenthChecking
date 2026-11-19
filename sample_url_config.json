@@ -1,0 +1,38 @@
+{
+  "ssl_bypass": true,
+  "force_https": true,
+  "verbose_logs": true,
+  "rules": [
+    {
+      "pattern": "https://teamruthless.authapi.xyz/connect",
+      "replacement": "https://yourpanel.com/connect",
+      "type": "EXACT",
+      "tag": "Auth Endpoint"
+    },
+    {
+      "pattern": "teamruthless.authapi.xyz",
+      "replacement": "yourpanel.com",
+      "type": "DOMAIN",
+      "tag": "Domain Swap"
+    },
+    {
+      "pattern": "authapi.xyz",
+      "replacement": "yourpanel.com",
+      "type": "CONTAINS",
+      "tag": "Root Domain Swap"
+    },
+    {
+      "pattern": "http://api.oldbackend.com/",
+      "replacement": "https://api.newbackend.com/",
+      "type": "PREFIX",
+      "tag": "API Gateway"
+    }
+  ],
+  "target_libs": [
+    "libil2cpp.so",
+    "libanogs.so",
+    "libUE4.so",
+    "libcurl.so",
+    "libmain.so"
+  ]
+}

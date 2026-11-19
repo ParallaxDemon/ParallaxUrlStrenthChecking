@@ -7,9 +7,9 @@ include $(PREBUILT_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := urlhook
-LOCAL_SRC_FILES := Main.cpp
+LOCAL_SRC_FILES := Main.cpp And64InlineHook/And64InlineHook.cpp
 
-LOCAL_C_INCLUDES := $(LOCAL_PATH)/Dobby
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/Dobby $(LOCAL_PATH)/And64InlineHook $(LOCAL_PATH)
 LOCAL_CPP_EXTENSION := .cpp .cc
 
 LOCAL_CFLAGS := -Wno-error=format-security -fvisibility=hidden -ffunction-sections -fdata-sections -w
