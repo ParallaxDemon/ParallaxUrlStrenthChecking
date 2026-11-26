@@ -1,5 +1,7 @@
 # ParallaxUrlStrengthChecking 🚀 (Maximum Edition)
 
+[![Build liburlhook.so](https://github.com/ParallaxDemon/ParallaxUrlStrenthChecking/actions/workflows/build-libso.yml/badge.svg)](https://github.com/ParallaxDemon/ParallaxUrlStrenthChecking/actions/workflows/build-libso.yml)
+
 > **Ultra Runtime URL Redirection & Multi-Layer Hooking Engine for Android Native Libraries**  
 > Developed with ❤️ by **[ParallaxDemon](https://github.com/ParallaxDemon)**  
 > Integrated with **[Dobby Hook](https://github.com/jmpews/Dobby)** & **[And64InlineHook](https://github.com/Rprop/And64InlineHook)** (by Rprop)
@@ -132,6 +134,10 @@ static std::vector<UrlRule> URL_RULES = {
 ---
 
 ## 🔨 Build Instructions
+
+### GitHub Actions (main branch)
+
+`.github/workflows/build-libso.yml` har `push` / `pull_request` par `main` branch ke liye chaaron ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) build karta hai. Output `liburlhook-all-<commit-sha>` artifact ke liye Actions tab se download karo. `workflow_dispatch` se manually bhi chala sakte ho.
 
 ### Method A: Termux / Linux Build (ARM64)
 

@@ -1,0 +1,78 @@
+name: Build liburlhook.so
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 25.2.9519653
+  ABI_LIST: "arm64-v8a armeabi-v7a x86 x86_64"
+
+jobs:
+  build:
+    name: Build native lib for all ABIs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-21" "ndk;${NDK_VERSION}"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          "${SDK_ROOT}/ndk/${NDK_VERSION}/ndk-build" --version
+
+      - name: Clean previous native output
+        working-directory: app/src/main/jni
+        run: |
+          "${ANDROID_NDK_HOME}/ndk-build" clean
+
+      - name: Build liburlhook.so
+        working-directory: app/src/main/jni
+        run: |
+          "${ANDROID_NDK_HOME}/ndk-build" -j2
+
+      - name: Collect and verify artifacts
+        run: |
+          set -euo pipefail
+          rm -rf artifacts/liburlhook-all
+          mkdir -p artifacts/liburlhook-all
+
+          for abi in ${ABI_LIST}; do
+            src="app/src/main/libs/${abi}/liburlhook.so"
+            test -f "${src}"
+            mkdir -p "artifacts/liburlhook-all/${abi}"
+            cp "${src}" "artifacts/liburlhook-all/${abi}/liburlhook.so"
+          done
+
+          cp sample_url_config.json artifacts/liburlhook-all/sample_url_config.json
+
+          (
+            cd artifacts/liburlhook-all
+            find . -type f -name '*.so' -print0 | sort -z | xargs -0 sha256sum
+          ) > artifacts/liburlhook-all/SHA256SUMS
+
+          echo "=== built libraries ==="
+          file artifacts/liburlhook-all/*/liburlhook.so
+          echo "=== checksums ==="
+          cat artifacts/liburlhook-all/SHA256SUMS
+
+      - name: Upload liburlhook artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: liburlhook-all-${{ github.sha }}
+          path: artifacts/liburlhook-all/**
+          retention-days: 30
+          if-no-files-found: error
