@@ -13,11 +13,11 @@ LOCAL_C_INCLUDES := $(LOCAL_PATH)/Dobby $(LOCAL_PATH)/And64InlineHook $(LOCAL_PA
 LOCAL_CPP_EXTENSION := .cpp .cc
 
 LOCAL_CFLAGS := -Wno-error=format-security -fvisibility=hidden -ffunction-sections -fdata-sections -w
-LOCAL_CFLAGS += -fno-rtti -fno-exceptions -fpermissive
+LOCAL_CFLAGS += -fno-rtti -fpermissive
 
 LOCAL_CPPFLAGS := -std=c++17
 LOCAL_CPPFLAGS += -Wno-error=format-security -fvisibility=hidden -ffunction-sections -fdata-sections -w
-LOCAL_CPPFLAGS += -fms-extensions -fno-rtti -fno-exceptions -fpermissive
+LOCAL_CPPFLAGS += -fms-extensions -fno-rtti -fpermissive
 
 LOCAL_LDLIBS := -llog -ldl
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all
