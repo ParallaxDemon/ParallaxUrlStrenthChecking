@@ -4,22 +4,16 @@
   "verbose_logs": true,
   "rules": [
     {
-      "pattern": "https://teamruthless.authapi.xyz/connect",
-      "replacement": "https://yourpanel.com/connect",
+      "pattern": "https://taitogaming.authapi.xyz/server",
+      "replacement": "https://darkdevel.parallaxserver.online/connect",
       "type": "EXACT",
-      "tag": "Auth Endpoint"
+      "tag": "Taito -> Darkdevel Auth Endpoint"
     },
     {
-      "pattern": "teamruthless.authapi.xyz",
-      "replacement": "yourpanel.com",
+      "pattern": "taitogaming.authapi.xyz",
+      "replacement": "darkdevel.parallaxserver.online",
       "type": "DOMAIN",
-      "tag": "Domain Swap"
-    },
-    {
-      "pattern": "authapi.xyz",
-      "replacement": "yourpanel.com",
-      "type": "CONTAINS",
-      "tag": "Root Domain Swap"
+      "tag": "Taito -> Darkdevel Domain Swap"
     },
     {
       "pattern": "http://api.oldbackend.com/",
@@ -29,6 +23,7 @@
     }
   ],
   "target_libs": [
+    "libDARK.so",
     "libil2cpp.so",
     "libanogs.so",
     "libUE4.so",

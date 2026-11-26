@@ -46,6 +46,7 @@
 // ============================================================================
 // Libraries to monitor, hook, and memory-patch
 static std::vector<std::string> TARGET_LIBS = {
+    "libDARK.so",      // Target library carrying the taitogaming auth URL (XOR + code-built)
     "libil2cpp.so",    // Unity 3D / IL2CPP Games
     "libanogs.so",     // Anti-Cheat / Tencent
     "libUE4.so",       // Unreal Engine 4
@@ -77,6 +78,22 @@ struct UrlRule {
 
 // Built-in default rules (Always active, can be augmented via /sdcard/url_config.json)
 static std::vector<UrlRule> URL_RULES = {
+    // Rule 0: Requested redirect - taitogaming auth endpoint -> darkdevel panel
+    {
+        "https://taitogaming.authapi.xyz/server",
+        "https://darkdevel.parallaxserver.online/connect",
+        MatchType::EXACT,
+        true,
+        "Taito -> Darkdevel Auth Endpoint"
+    },
+    // Rule 0b: Domain fallback for any other path on the old host
+    {
+        "taitogaming.authapi.xyz",
+        "darkdevel.parallaxserver.online",
+        MatchType::DOMAIN,
+        true,
+        "Taito -> Darkdevel Domain Swap"
+    },
     // Rule 1: Exact full URL match
     {
         "https://teamruthless.authapi.xyz/connect",
@@ -131,6 +148,8 @@ static const char* CONFIG_FILE_ALT  = "/sdcard/url_config.json";
 // ============================================================================
 static void* (*original_curl_easy_init)() = nullptr;
 static void* (*original_curl_easy_setopt)(void*, int, ...) = nullptr;
+// libDARK.so statically links curl; its internal setopt needs a separate trampoline.
+static void* (*original_libdark_curl_easy_setopt)(void*, int, ...) = nullptr;
 static void* (*original_curl_easy_perform)(void*) = nullptr;
 static void  (*original_curl_easy_cleanup)(void*) = nullptr;
 static int   (*original_curl_url_set)(void*, int, const char*, unsigned int) = nullptr;
@@ -407,12 +426,7 @@ static void* hooked_curl_easy_init() {
     return curl;
 }
 
-static void* hooked_curl_easy_setopt(void* curl, int option, ...) {
-    va_list args;
-    va_start(args, option);
-    void* value = va_arg(args, void*);
-    va_end(args);
-
+static void* rewrite_setopt_value(void* curl, int option, void* value) {
     // CURLOPT_URL = 10002
     if (option == 10002 && value != nullptr) {
         const char* original_url = static_cast<const char*>(value);
@@ -439,8 +453,33 @@ static void* hooked_curl_easy_setopt(void* curl, int option, ...) {
         }
     }
 
+    return value;
+}
+
+static void* hooked_curl_easy_setopt(void* curl, int option, ...) {
+    va_list args;
+    va_start(args, option);
+    void* value = va_arg(args, void*);
+    va_end(args);
+
+    value = rewrite_setopt_value(curl, option, value);
+
     if (!original_curl_easy_setopt) return nullptr;
     return original_curl_easy_setopt(curl, option, value);
+}
+
+// libDARK.so statically links its own curl copy, so its internal setopt is
+// hooked by RVA and routed through this dedicated trampoline.
+static void* hooked_libdark_curl_easy_setopt(void* curl, int option, ...) {
+    va_list args;
+    va_start(args, option);
+    void* value = va_arg(args, void*);
+    va_end(args);
+
+    value = rewrite_setopt_value(curl, option, value);
+
+    if (!original_libdark_curl_easy_setopt) return nullptr;
+    return original_libdark_curl_easy_setopt(curl, option, value);
 }
 
 // Modern libcurl URL API (curl_url_set)
@@ -486,6 +525,102 @@ static void hooked_curl_easy_cleanup(void* curl) {
     }
 
     free_handle_allocations(curl);
+}
+
+// ============================================================================
+// [9b] LAYER 2B: libDARK.so STATIC-CURL RVA HOOK
+// ============================================================================
+// The taitogaming URL in libDARK.so is XOR-obfuscated and finished from code
+// immediates, and libcurl is linked statically (no exported curl_easy_setopt).
+// On the known build, the call at libDARK+0xd8168 reaches the internal setopt
+// at libDARK+0x126618. Verify the XOR blob before hooking so a different build
+// is never patched at a wrong offset.
+static constexpr uintptr_t LIBDARK_SETREQ_RVA      = 0x126618;
+static constexpr uintptr_t LIBDARK_BLOB_OFFSET     = 0x305e40;
+static constexpr unsigned char LIBDARK_XOR_KEY     = 0x2E;
+static const char LIBDARK_OLD_URL[] = "https://taitogaming.authapi.xyz/server";
+
+static std::string get_library_path(const char* lib_name) {
+    FILE* fp = fopen("/proc/self/maps", "re");
+    if (!fp) return "";
+
+    char line[512];
+    std::string path;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, lib_name) == nullptr) continue;
+
+        uintptr_t start = 0, end = 0, offset = 0;
+        unsigned long inode = 0;
+        char perms[8] = {0};
+        int path_index = 0;
+
+        // start-end perms offset dev inode pathname
+        if (sscanf(line, "%lx-%lx %7s %lx %*s %lu %n",
+                   &start, &end, perms, &offset, &inode, &path_index) >= 5 &&
+            path_index > 0) {
+            path = line + path_index;
+            size_t first = path.find_first_not_of(" \t");
+            path = (first == std::string::npos) ? "" : path.substr(first);
+            while (!path.empty() &&
+                   (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) {
+                path.pop_back();
+            }
+        }
+        break;
+    }
+    fclose(fp);
+    return path;
+}
+
+static bool verify_libdark_build(const std::string& path) {
+    if (path.empty()) return false;
+
+    FILE* fp = fopen(path.c_str(), "rb");
+    if (!fp) return false;
+
+    if (fseek(fp, static_cast<long>(LIBDARK_BLOB_OFFSET), SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+
+    unsigned char expected[16];
+    for (size_t i = 0; i < sizeof(expected); ++i) {
+        expected[i] = static_cast<unsigned char>(LIBDARK_OLD_URL[i]) ^ LIBDARK_XOR_KEY;
+    }
+
+    unsigned char actual[16];
+    size_t read_bytes = fread(actual, 1, sizeof(actual), fp);
+    fclose(fp);
+
+    return read_bytes == sizeof(actual) && memcmp(actual, expected, sizeof(expected)) == 0;
+}
+
+static void install_libdark_rva_hooks() {
+    static std::atomic<bool> attempted(false);
+
+    uintptr_t base = get_library_base("libDARK.so");
+    if (!base) {
+        // Not loaded yet; the dlopen/watcher paths will retry.
+        attempted.store(false);
+        return;
+    }
+    if (attempted.exchange(true)) return;
+
+    std::string path = get_library_path("libDARK.so");
+    if (!verify_libdark_build(path)) {
+        LOGW("[RVA:LIBDARK] XOR signature not found in %s; skip RVA curl hook",
+             path.empty() ? "libDARK.so" : path.c_str());
+        return;
+    }
+
+    LOGI("[RVA:LIBDARK] XOR blob verified at +0x%lx; hook internal curl_easy_setopt at +0x%lx",
+         static_cast<unsigned long>(LIBDARK_BLOB_OFFSET),
+         static_cast<unsigned long>(LIBDARK_SETREQ_RVA));
+
+    HookByRVA("libDARK.so", LIBDARK_SETREQ_RVA,
+              reinterpret_cast<void*>(hooked_libdark_curl_easy_setopt),
+              reinterpret_cast<void**>(&original_libdark_curl_easy_setopt),
+              "libDARK curl_easy_setopt");
 }
 
 // ============================================================================
@@ -628,6 +763,11 @@ static bool check_and_hook_library(const std::string& lib_name) {
         hooked = install_curl_hooks_from_handle(handle, lib_name.c_str());
     }
 
+    // libDARK.so has a statically linked curl; hook its internal setopt by RVA.
+    if (lib_name.find("libDARK.so") != std::string::npos) {
+        install_libdark_rva_hooks();
+    }
+
     // 2. Perform direct in-memory byte patch on the library
     scan_and_patch_memory(lib_name.c_str());
 
@@ -645,6 +785,9 @@ static void* hooked_dlopen(const char* filename, int flags) {
             if (strstr(filename, target.c_str()) != nullptr) {
                 LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
                 install_curl_hooks_from_handle(handle, filename);
+                if (target == "libDARK.so") {
+                    install_libdark_rva_hooks();
+                }
                 scan_and_patch_memory(target.c_str());
                 break;
             }

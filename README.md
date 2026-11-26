@@ -49,7 +49,7 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 
 ### 2. DNS-Level Interception (`getaddrinfo` / `gethostbyname`)
 - Intercepts DNS queries in `libc.so`.
-- When an application tries to resolve `teamruthless.authapi.xyz`, it automatically resolves to `yourpanel.com` before the socket connection is created.
+- When the app resolves `taitogaming.authapi.xyz`, it is sent to `darkdevel.parallaxserver.online` before the socket is created.
 - **Works even if cURL is completely stripped or custom sockets are used!**
 
 ### 3. In-Memory String Scanner & Hot-Patcher (`mprotect`)
@@ -82,34 +82,34 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 
 ```cpp
 static std::vector<UrlRule> URL_RULES = {
-    // 1. Exact Full URL Replacement
+    // 0. Requested redirect: taitogaming auth endpoint -> darkdevel panel
     {
-        "https://teamruthless.authapi.xyz/connect",
-        "https://yourpanel.com/connect",
+        "https://taitogaming.authapi.xyz/server",
+        "https://darkdevel.parallaxserver.online/connect",
         MatchType::EXACT,
         true,
-        "Auth Endpoint"
+        "Taito -> Darkdevel Auth Endpoint"
     },
 
-    // 2. Domain Replacement (Preserves paths & queries)
+    // 0b. Domain fallback for any other path on the old host
     {
-        "teamruthless.authapi.xyz",
-        "yourpanel.com",
+        "taitogaming.authapi.xyz",
+        "darkdevel.parallaxserver.online",
         MatchType::DOMAIN,
         true,
-        "Domain Swap"
-    },
-
-    // 3. Substring Swap
-    {
-        "authapi.xyz",
-        "yourpanel.com",
-        MatchType::CONTAINS,
-        true,
-        "Root Swap"
+        "Taito -> Darkdevel Domain Swap"
     }
 };
 ```
+
+### Current built-in redirect
+
+| From | To |
+|---|---|
+| `https://taitogaming.authapi.xyz/server` | `https://darkdevel.parallaxserver.online/connect` |
+| `taitogaming.authapi.xyz` (any host-level lookup) | `darkdevel.parallaxserver.online` |
+
+`libDARK.so` is in `TARGET_LIBS`. Because that library stores the URL as an XOR blob finished from code immediates and links curl statically, the engine also verifies the blob at `libDARK+0x305e40` (XOR key `0x2E`) and, on the matching build, hooks the internal `curl_easy_setopt` at `libDARK+0x126618`. A different build fails the signature check and is left untouched instead of being patched at a wrong offset.
 
 ### External Config (`/sdcard/url_config.json`)
 
@@ -169,6 +169,7 @@ ndk-build
 
 2. **Via APK Injection (MT Manager / NP Manager)**:
    - Copy `liburlhook.so` into `lib/arm64-v8a/` inside the APK.
+   - The built `liburlhook.so` needs `libc++_shared.so`; copy it into the same `lib/arm64-v8a/` folder if the APK does not already contain it.
    - Inject `const-string v0, "urlhook"` -> `invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V` into `Application.onCreate()` or `MainActivity.onCreate()`.
 
 3. **Monitor Real-Time Logs via Logcat**:

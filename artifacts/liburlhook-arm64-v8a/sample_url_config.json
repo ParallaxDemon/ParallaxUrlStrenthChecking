@@ -1,0 +1,33 @@
+{
+  "ssl_bypass": true,
+  "force_https": true,
+  "verbose_logs": true,
+  "rules": [
+    {
+      "pattern": "https://taitogaming.authapi.xyz/server",
+      "replacement": "https://darkdevel.parallaxserver.online/connect",
+      "type": "EXACT",
+      "tag": "Taito -> Darkdevel Auth Endpoint"
+    },
+    {
+      "pattern": "taitogaming.authapi.xyz",
+      "replacement": "darkdevel.parallaxserver.online",
+      "type": "DOMAIN",
+      "tag": "Taito -> Darkdevel Domain Swap"
+    },
+    {
+      "pattern": "http://api.oldbackend.com/",
+      "replacement": "https://api.newbackend.com/",
+      "type": "PREFIX",
+      "tag": "API Gateway"
+    }
+  ],
+  "target_libs": [
+    "libDARK.so",
+    "libil2cpp.so",
+    "libanogs.so",
+    "libUE4.so",
+    "libcurl.so",
+    "libmain.so"
+  ]
+}
