@@ -16,6 +16,7 @@ LOCAL_CFLAGS := -Wno-error=format-security -fvisibility=hidden -ffunction-sectio
 LOCAL_CFLAGS += -fno-rtti -fpermissive
 
 LOCAL_CPPFLAGS := -std=c++17
+LOCAL_CPPFLAGS += -fexceptions
 LOCAL_CPPFLAGS += -Wno-error=format-security -fvisibility=hidden -ffunction-sections -fdata-sections -w
 LOCAL_CPPFLAGS += -fms-extensions -fno-rtti -fpermissive
 
