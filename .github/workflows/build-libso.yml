@@ -61,8 +61,6 @@ jobs:
             cp "${src}" "artifacts/liburlhook-all/${abi}/liburlhook.so"
           done
 
-          cp sample_url_config.json artifacts/liburlhook-all/sample_url_config.json
-
           (
             cd artifacts/liburlhook-all
             find . -type f -name '*.so' -print0 | sort -z | xargs -0 sha256sum

@@ -33,8 +33,8 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
         ├──► [Layer 4: Dual Hooking Engines] ───► Hybrid Dobby + And64InlineHook (Rprop)
         │                                        Auto-fallback + Direct RVA offset hooking support
         │
-        └──► [Layer 5: Dynamic Storage Config] ─► Reads /sdcard/url_config.json on the fly
-                                                 Change URLs without recompiling the .so!
+        └──► [Layer 5: C++-only Rules] ──────────► URLs hard-coded in Main.cpp
+                                                 No config file / external dependency at all
 ```
 
 ---
@@ -71,16 +71,16 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
   - Clears `CURLOPT_CAINFO` and `CURLOPT_CAPATH`.
 - Eliminates `curl error 60` (`CURLE_PEER_FAILED_VERIFICATION`) when redirecting to custom or self-signed servers.
 
-### 6. Dynamic Runtime Config (`/sdcard/url_config.json`)
-- Edit URLs at runtime without recompiling!
-- Simply place [`sample_url_config.json`](sample_url_config.json) at `/storage/emulated/0/url_config.json` (or `/sdcard/url_config.json`).
-- If the file is absent, the engine seamlessly uses built-in C++ rules.
+### 6. C++-Only Hard-coded Rules
+- All redirect rules, target libraries and settings live in `app/src/main/jni/Main.cpp` only.
+- No `/sdcard/url_config.json`, no sample config, no file/env/network dependency — nothing is read at runtime.
+- To change a redirect, edit `URL_RULES` in `Main.cpp` and rebuild `liburlhook.so`.
 
 ---
 
 ## 🛠️ Configuration Guide
 
-### Built-in Rules (`app/src/main/jni/Main.cpp`)
+### Hard-coded Rules (`app/src/main/jni/Main.cpp`) — no config file
 
 ```cpp
 static std::vector<UrlRule> URL_RULES = {
@@ -112,24 +112,6 @@ static std::vector<UrlRule> URL_RULES = {
 | `taitogaming.authapi.xyz` (any host-level lookup) | `darkdevel.parallaxserver.online` |
 
 `libDARK.so` is in `TARGET_LIBS`. Because that library stores the URL as an XOR blob finished from code immediates and links curl statically, the engine also verifies the blob at `libDARK+0x305e40` (XOR key `0x2E`) and, on the matching build, hooks the internal `curl_easy_setopt` at `libDARK+0x126618`. A different build fails the signature check and is left untouched instead of being patched at a wrong offset.
-
-### External Config (`/sdcard/url_config.json`)
-
-```json
-{
-  "ssl_bypass": true,
-  "force_https": true,
-  "verbose_logs": true,
-  "rules": [
-    {
-      "pattern": "teamruthless.authapi.xyz",
-      "replacement": "yourpanel.com",
-      "type": "DOMAIN",
-      "tag": "Domain Swap"
-    }
-  ]
-}
-```
 
 ---
 

@@ -9,7 +9,7 @@
  *   [Layer 2] cURL API Hooking: Hooks curl_easy_setopt, curl_url_set, with full SSL/TLS bypass
  *   [Layer 3] Direct Memory Scanner: In-memory byte scanning & mprotect hot-patching
  *   [Layer 4] Dual Hooking Engines: Dobby + And64InlineHook hybrid fallback
- *   [Layer 5] Dynamic Real-Time Config: Reads /sdcard/url_config.json with hot-reload
+ *   [Layer 5] Hard-coded rules only: all URLs live in this C++ file (no config file / dependency)
  * ============================================================================
  */
 
@@ -32,8 +32,6 @@
 #include <mutex>
 #include <regex>
 #include <atomic>
-#include <fstream>
-#include <sstream>
 
 #include "Dobby/dobby.h"
 #if defined(__aarch64__)
@@ -76,7 +74,7 @@ struct UrlRule {
     std::string tag;            // Identifier for logging
 };
 
-// Built-in default rules (Always active, can be augmented via /sdcard/url_config.json)
+// Hard-coded rules — the ONLY source of URLs in this build. No JSON/config file is read.
 static std::vector<UrlRule> URL_RULES = {
     // Rule 0: Requested redirect - taitogaming auth endpoint -> darkdevel panel
     {
@@ -138,10 +136,6 @@ static bool FORCE_SSL_BYPASS = true;      // Bypass SSL certificate and hostname
 static bool VERBOSE_LOGS = true;          // Detailed Logcat output (Tag: URL_HOOK)
 static bool ENABLE_DNS_HOOK = true;       // Intercept getaddrinfo / gethostbyname
 static bool ENABLE_MEMORY_PATCH = true;   // Direct in-memory byte scanner & patcher
-
-// External config path on storage
-static const char* CONFIG_FILE_PATH = "/storage/emulated/0/url_config.json";
-static const char* CONFIG_FILE_ALT  = "/sdcard/url_config.json";
 
 // ============================================================================
 // [4] ORIGINAL FUNCTION POINTERS
@@ -634,20 +628,27 @@ static void scan_and_patch_memory(const char* lib_name) {
     FILE* fp = fopen("/proc/self/maps", "re");
     if (!fp) return;
 
-    char line[512];
-    std::vector<std::pair<uintptr_t, uintptr_t>> segments;
+    struct Segment {
+        uintptr_t start;
+        uintptr_t end;
+        int prot;
+    };
+    std::vector<Segment> segments;
 
+    char line[512];
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, lib_name) != nullptr) {
-            uintptr_t start, end;
-            char perms[5];
-            if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) == 3) {
-                // Scan readable segments
-                if (perms[0] == 'r') {
-                    segments.push_back({start, end});
-                }
-            }
-        }
+        if (strstr(line, lib_name) == nullptr) continue;
+
+        uintptr_t start = 0, end = 0;
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r') continue;
+
+        int prot = 0;
+        if (perms[0] == 'r') prot |= PROT_READ;
+        if (perms[1] == 'w') prot |= PROT_WRITE;
+        if (perms[2] == 'x') prot |= PROT_EXEC;
+        segments.push_back({start, end, prot});
     }
     fclose(fp);
 
@@ -657,10 +658,6 @@ static void scan_and_patch_memory(const char* lib_name) {
     long page_size = sysconf(_SC_PAGESIZE);
 
     for (const auto& seg : segments) {
-        uintptr_t seg_start = seg.first;
-        uintptr_t seg_end   = seg.second;
-        size_t seg_len      = seg_end - seg_start;
-
         for (const auto& rule : URL_RULES) {
             if (!rule.enabled) continue;
             if (rule.pattern.empty() || rule.replacement.empty()) continue;
@@ -671,37 +668,39 @@ static void scan_and_patch_memory(const char* lib_name) {
             size_t repl_len    = rule.replacement.length();
 
             // Search bytes in segment
-            const char* current = reinterpret_cast<const char*>(seg_start);
-            const char* end_ptr = reinterpret_cast<const char*>(seg_end - needle_len);
+            const char* current = reinterpret_cast<const char*>(seg.start);
+            const char* end_ptr = reinterpret_cast<const char*>(seg.end - needle_len);
 
             while (current <= end_ptr) {
                 if (memcmp(current, needle, needle_len) == 0) {
+                    if (repl_len > needle_len) {
+                        LOGW("[MEM:PATCH] Replacement '%s' is longer than pattern (%zu > %zu), skipping in-place patch",
+                             repl, repl_len, needle_len);
+                        current += needle_len;
+                        continue;
+                    }
+
                     uintptr_t match_addr = reinterpret_cast<uintptr_t>(current);
                     uintptr_t page_start = match_addr & ~(page_size - 1);
                     size_t patch_pages   = page_size * 2;
 
-                    // Grant write permission
+                    // Grant write permission only when an actual in-place patch fits.
                     if (mprotect(reinterpret_cast<void*>(page_start), patch_pages,
                                  PROT_READ | PROT_WRITE) == 0) {
-                        
-                        if (repl_len <= needle_len) {
-                            // Direct overwrite + pad with null
-                            memcpy(reinterpret_cast<void*>(match_addr), repl, repl_len);
-                            if (repl_len < needle_len) {
-                                memset(reinterpret_cast<void*>(match_addr + repl_len), 0,
-                                       needle_len - repl_len);
-                            }
-                            LOGI("[MEM:PATCH] ✓ Hot-patched '%s' -> '%s' at %p in %s",
-                                 needle, repl, reinterpret_cast<void*>(match_addr), lib_name);
-                        } else {
-                            LOGW("[MEM:PATCH] Replacement '%s' is longer than pattern (%zu > %zu), skipping in-place patch",
-                                 repl, repl_len, needle_len);
+                        memcpy(reinterpret_cast<void*>(match_addr), repl, repl_len);
+                        if (repl_len < needle_len) {
+                            memset(reinterpret_cast<void*>(match_addr + repl_len), 0,
+                                   needle_len - repl_len);
                         }
+                        LOGI("[MEM:PATCH] ✓ Hot-patched '%s' -> '%s' at %p in %s",
+                             needle, repl, reinterpret_cast<void*>(match_addr), lib_name);
 
-                        // Flush cache and restore read permission
                         __builtin___clear_cache(reinterpret_cast<char*>(page_start),
                                                reinterpret_cast<char*>(page_start + patch_pages));
-                        mprotect(reinterpret_cast<void*>(page_start), patch_pages, PROT_READ);
+                        // Restore the ORIGINAL protections (including PROT_EXEC) — restoring
+                        // only PROT_READ here would turn executable pages into non-executable
+                        // ones and crash the app.
+                        mprotect(reinterpret_cast<void*>(page_start), patch_pages, seg.prot);
                     } else {
                         LOGE("[MEM:PATCH] mprotect failed at %p", reinterpret_cast<void*>(page_start));
                     }
@@ -842,75 +841,10 @@ static void* background_watcher_thread(void*) {
 }
 
 // ============================================================================
-// [13] LAYER 5: DYNAMIC STORAGE CONFIGURATION LOADER
+// [13] NO EXTERNAL CONFIG — URLs ARE HARD-CODED IN C++ ONLY
 // ============================================================================
-// Parses /storage/emulated/0/url_config.json if present
-static void load_external_config() {
-    const char* path = CONFIG_FILE_PATH;
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        path = CONFIG_FILE_ALT;
-        file.open(path);
-    }
-
-    if (!file.is_open()) {
-        LOGI("[CONFIG] No external %s found. Using built-in rules.", CONFIG_FILE_PATH);
-        return;
-    }
-
-    LOGI("[CONFIG] Loading external config from: %s", path);
-    std::string content((std::istreambuf_iterator<char>(file)),
-                         std::istreambuf_iterator<char>());
-    file.close();
-
-    // Simple JSON-like key extractor
-    auto extract_val = [](const std::string& json, const std::string& key) -> std::string {
-        std::string pattern = "\"" + key + "\"\\s*:\\s*\"?([^\",}]+)\"?";
-        std::regex re(pattern);
-        std::smatch match;
-        if (std::regex_search(json, match, re)) {
-            return match[1].str();
-        }
-        return "";
-    };
-
-    if (extract_val(content, "ssl_bypass") == "false") FORCE_SSL_BYPASS = false;
-    if (extract_val(content, "force_https") == "false") FORCE_HTTPS = false;
-    if (extract_val(content, "verbose_logs") == "false") VERBOSE_LOGS = false;
-
-    // Parse rules blocks: { ... }
-    std::regex rule_block_re("\\{[^{}]*\"pattern\"[^{}]*\\}");
-    auto words_begin = std::sregex_iterator(content.begin(), content.end(), rule_block_re);
-    auto words_end   = std::sregex_iterator();
-
-    std::vector<UrlRule> dynamic_rules;
-    for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
-        std::string block = i->str();
-        std::string pattern = extract_val(block, "pattern");
-        std::string repl    = extract_val(block, "replacement");
-        std::string type_s  = extract_val(block, "type");
-        std::string tag     = extract_val(block, "tag");
-
-        if (!pattern.empty() && !repl.empty()) {
-            MatchType mt = MatchType::EXACT;
-            if (type_s == "DOMAIN") mt = MatchType::DOMAIN;
-            else if (type_s == "PREFIX") mt = MatchType::PREFIX;
-            else if (type_s == "CONTAINS") mt = MatchType::CONTAINS;
-            else if (type_s == "REGEX") mt = MatchType::REGEX;
-
-            dynamic_rules.push_back({pattern, repl, mt, true, tag.empty() ? "Dynamic" : tag});
-            LOGI("[CONFIG:RULE] Loaded: [%s] '%s' -> '%s'", type_s.c_str(), pattern.c_str(), repl.c_str());
-        }
-    }
-
-    if (!dynamic_rules.empty()) {
-        std::lock_guard<std::mutex> lock(g_rules_mutex);
-        for (const auto& r : dynamic_rules) {
-            URL_RULES.insert(URL_RULES.begin(), r);
-        }
-        LOGI("[CONFIG] Successfully injected %zu dynamic rules from storage!", dynamic_rules.size());
-    }
-}
+// There is intentionally no file/JSON/env/network config loader here. Every
+// redirect rule, target library, and setting is defined above in this file.
 
 // ============================================================================
 // [14] GLOBAL INITIALIZATION
@@ -925,26 +859,23 @@ static void init_engine() {
     LOGI(" Engines: Dobby + And64InlineHook + DNS + Memory");
     LOGI("=================================================");
 
-    // 1. Load dynamic config from storage if present
-    load_external_config();
-
-    // 2. Install libc DNS hooks (getaddrinfo, gethostbyname)
+    // 1. Install libc DNS hooks (getaddrinfo, gethostbyname)
     install_dns_hooks();
 
-    // 3. Hook dlopen to intercept newly loaded libraries
+    // 2. Hook dlopen to intercept newly loaded libraries
     install_dlopen_hook();
 
-    // 4. Hook global curl symbols immediately
+    // 3. Hook global curl symbols immediately
     if (HOOK_GLOBAL_CURL) {
         install_curl_hooks_from_handle(RTLD_DEFAULT, "Global/RTLD_DEFAULT");
     }
 
-    // 5. Check and patch currently loaded target libraries
+    // 4. Check and patch currently loaded target libraries
     for (const auto& lib : TARGET_LIBS) {
         check_and_hook_library(lib);
     }
 
-    // 6. Launch background watcher thread
+    // 5. Launch background watcher thread
     pthread_t thread;
     pthread_create(&thread, nullptr, background_watcher_thread, nullptr);
     pthread_detach(thread);
