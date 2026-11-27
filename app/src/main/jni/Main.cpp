@@ -153,7 +153,14 @@ static void* (*original_dlopen)(const char*, int) = nullptr;
 static int   (*original_getaddrinfo)(const char*, const char*, const struct addrinfo*, struct addrinfo**) = nullptr;
 static struct hostent* (*original_gethostbyname)(const char*) = nullptr;
 
-static std::unordered_set<void*> g_hooked_addresses;
+// POD-only tracking: no std::unordered_set here. A loader-time constructor used
+// to insert into a global unordered_set before its bucket state was ready,
+// which could throw std::overflow_error(__next_prime overflow) and abort the
+// process inside System.loadLibrary(). A fixed array has no dynamic
+// initialization and cannot rehash/throw.
+static constexpr size_t MAX_TRACKED_HOOKS = 256;
+static void* g_hooked_addresses[MAX_TRACKED_HOOKS] = {};
+static size_t g_hooked_count = 0;
 static std::mutex g_hook_mutex;
 
 // ============================================================================
@@ -172,8 +179,10 @@ bool UnifiedHook(void* target, void* replace, void** origin, const char* name) {
     if (target == replace) return true; // Never hook our own trampoline.
 
     std::lock_guard<std::mutex> lock(g_hook_mutex);
-    if (g_hooked_addresses.find(target) != g_hooked_addresses.end()) {
-        return true; // Already hooked
+    for (size_t i = 0; i < g_hooked_count; ++i) {
+        if (g_hooked_addresses[i] == target) {
+            return true; // Already hooked
+        }
     }
 
     bool success = false;
@@ -198,7 +207,11 @@ bool UnifiedHook(void* target, void* replace, void** origin, const char* name) {
 #endif
 
     if (success) {
-        g_hooked_addresses.insert(target);
+        if (g_hooked_count < MAX_TRACKED_HOOKS) {
+            g_hooked_addresses[g_hooked_count++] = target;
+        } else {
+            LOGW("[HOOK:WARN] Hook tracking full (%zu), still hooked %s", g_hooked_count, name);
+        }
     } else {
         LOGE("[HOOK:FAIL] All hook engines failed for %s at %p", name, target);
     }
@@ -237,25 +250,42 @@ bool HookByRVA(const char* lib_name, uintptr_t offset, void* replace, void** ori
 // ============================================================================
 // [6] CRASH-PROOF MEMORY LIFECYCLE MANAGEMENT
 // ============================================================================
-static std::unordered_map<void*, std::vector<char*>> g_handle_allocations;
+// POD-only allocation tracking (same rationale as hook tracking above).
+struct TrackedAllocation {
+    void* curl;
+    char* ptr;
+};
+static constexpr size_t MAX_TRACKED_ALLOCATIONS = 256;
+static TrackedAllocation g_handle_allocations[MAX_TRACKED_ALLOCATIONS] = {};
+static size_t g_allocation_count = 0;
 static std::mutex g_alloc_mutex;
 
 static void track_allocation(void* curl, char* ptr) {
     if (!curl || !ptr) return;
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
-    g_handle_allocations[curl].push_back(ptr);
+    if (g_allocation_count < MAX_TRACKED_ALLOCATIONS) {
+        g_handle_allocations[g_allocation_count].curl = curl;
+        g_handle_allocations[g_allocation_count].ptr = ptr;
+        ++g_allocation_count;
+    } else {
+        LOGW("[ALLOC] Tracking table full, freeing untracked buffer");
+        free(ptr);
+    }
 }
 
 static void free_handle_allocations(void* curl) {
     if (!curl) return;
     std::lock_guard<std::mutex> lock(g_alloc_mutex);
-    auto it = g_handle_allocations.find(curl);
-    if (it != g_handle_allocations.end()) {
-        for (char* ptr : it->second) {
-            if (ptr) free(ptr);
+    size_t kept = 0;
+    for (size_t i = 0; i < g_allocation_count; ++i) {
+        if (g_handle_allocations[i].curl == curl) {
+            if (g_handle_allocations[i].ptr) free(g_handle_allocations[i].ptr);
+            continue;
         }
-        g_handle_allocations.erase(it);
+        if (kept != i) g_handle_allocations[kept] = g_handle_allocations[i];
+        ++kept;
     }
+    g_allocation_count = kept;
 }
 
 // ============================================================================
@@ -921,10 +951,12 @@ static void init_engine() {
     pthread_detach(thread);
 }
 
-__attribute__((constructor)) static void on_library_load() {
-    init_engine();
-}
-
+// IMPORTANT: no __attribute__((constructor)) here. Running the hooking engine
+// from the ELF constructor executes during the linker's call_constructors(),
+// before all C++ runtime globals are guaranteed usable and on an arbitrary
+// loader thread. That path produced the __next_prime overflow abort during
+// System.loadLibrary(). ART calls JNI_OnLoad immediately after constructors,
+// so this is still early enough to install all hooks for the renamed library.
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     LOGI("[JNI] JNI_OnLoad called");
     init_engine();
