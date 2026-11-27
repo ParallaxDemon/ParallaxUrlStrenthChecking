@@ -119,6 +119,11 @@ static std::vector<UrlRule> URL_RULES = {
 |---|---|
 | `https://taitogaming.authapi.xyz/server` | `https://darkdevel.parallaxserver.online/connect` |
 | `taitogaming.authapi.xyz` (any host-level lookup) | `darkdevel.parallaxserver.online` |
+| `https://teamruthless.authapi.xyz/connect` | `https://darkdevel.parallaxserver.online/connect` |
+| `teamruthless.authapi.xyz` (any host-level lookup) | `darkdevel.parallaxserver.online` |
+| `authapi.xyz` (any remaining substring) | `darkdevel.parallaxserver.online` |
+
+Sirf `darkdevel.parallaxserver.online` target hai — koi placeholder/host nahi. Endpoint ko app ke expected JSON schema ka response dena zaroori hai, warna `libDARK.so` me `nlohmann::parse_error` se SIGABRT aayega.
 
 `libDARK.so` is in `TARGET_LIBS`. Because that library stores the URL as an XOR blob finished from code immediates and links curl statically, the engine also verifies the blob at `libDARK+0x305e40` (XOR key `0x2E`) and, on the matching build, hooks the internal `curl_easy_setopt` at `libDARK+0x126618`. A different build fails the signature check and is left untouched instead of being patched at a wrong offset.
 

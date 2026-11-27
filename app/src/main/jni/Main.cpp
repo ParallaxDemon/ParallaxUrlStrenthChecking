@@ -93,10 +93,10 @@ static std::vector<UrlRule> URL_RULES = {
         true,
         "Taito -> Darkdevel Domain Swap"
     },
-    // Rule 1: Exact full URL match
+    // Rule 1: Exact full URL match -> darkdevel panel
     {
         "https://teamruthless.authapi.xyz/connect",
-        "https://yourpanel.com/connect",
+        "https://darkdevel.parallaxserver.online/connect",
         MatchType::EXACT,
         true,
         "Auth Connect Endpoint"
@@ -104,15 +104,15 @@ static std::vector<UrlRule> URL_RULES = {
     // Rule 2: Domain redirection (redirects all paths on this domain)
     {
         "teamruthless.authapi.xyz",
-        "yourpanel.com",
+        "darkdevel.parallaxserver.online",
         MatchType::DOMAIN,
         true,
         "Auth Domain Swap"
     },
-    // Rule 3: Substring match
+    // Rule 3: Substring match -> darkdevel panel host
     {
         "authapi.xyz",
-        "yourpanel.com",
+        "darkdevel.parallaxserver.online",
         MatchType::CONTAINS,
         true,
         "Root Domain Fallback"
