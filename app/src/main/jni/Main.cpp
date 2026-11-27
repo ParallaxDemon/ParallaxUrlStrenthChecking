@@ -10,6 +10,7 @@
  *   [Layer 3] Direct Memory Scanner: In-memory byte scanning & mprotect hot-patching
  *   [Layer 4] Dual Hooking Engines: Dobby + And64InlineHook hybrid fallback
  *   [Layer 5] Hard-coded rules only: all URLs live in this C++ file (no config file / dependency)
+ *   [Hardening] Page-safe mprotect, NOLOAD-only scans, dlopen fallback, retry-safe RVA hooks
  * ============================================================================
  */
 
@@ -168,6 +169,7 @@ static HookEngine G_HOOK_ENGINE = HookEngine::AUTO_HYBRID;
 
 bool UnifiedHook(void* target, void* replace, void** origin, const char* name) {
     if (!target || !replace) return false;
+    if (target == replace) return true; // Never hook our own trampoline.
 
     std::lock_guard<std::mutex> lock(g_hook_mutex);
     if (g_hooked_addresses.find(target) != g_hooked_addresses.end()) {
@@ -265,7 +267,7 @@ static std::string rewrite_url(const std::string& input_url) {
     bool modified = false;
 
     for (const auto& rule : URL_RULES) {
-        if (!rule.enabled) continue;
+        if (!rule.enabled || rule.pattern.empty()) continue;
 
         switch (rule.matchType) {
             case MatchType::EXACT: {
@@ -350,7 +352,7 @@ static std::string rewrite_url(const std::string& input_url) {
 static std::string rewrite_host(const std::string& input_host) {
     std::lock_guard<std::mutex> lock(g_rules_mutex);
     for (const auto& rule : URL_RULES) {
-        if (!rule.enabled) continue;
+        if (!rule.enabled || rule.pattern.empty()) continue;
         if (rule.matchType == MatchType::DOMAIN || rule.matchType == MatchType::CONTAINS) {
             size_t pos = input_host.find(rule.pattern);
             if (pos != std::string::npos) {
@@ -592,18 +594,20 @@ static bool verify_libdark_build(const std::string& path) {
 static void install_libdark_rva_hooks() {
     static std::atomic<bool> attempted(false);
 
-    uintptr_t base = get_library_base("libDARK.so");
-    if (!base) {
+    bool expected = false;
+    if (!attempted.compare_exchange_strong(expected, true)) return;
+
+    if (!get_library_base("libDARK.so")) {
         // Not loaded yet; the dlopen/watcher paths will retry.
         attempted.store(false);
         return;
     }
-    if (attempted.exchange(true)) return;
 
     std::string path = get_library_path("libDARK.so");
     if (!verify_libdark_build(path)) {
         LOGW("[RVA:LIBDARK] XOR signature not found in %s; skip RVA curl hook",
              path.empty() ? "libDARK.so" : path.c_str());
+        attempted.store(false); // Let a later build/reload retry safely.
         return;
     }
 
@@ -611,10 +615,14 @@ static void install_libdark_rva_hooks() {
          static_cast<unsigned long>(LIBDARK_BLOB_OFFSET),
          static_cast<unsigned long>(LIBDARK_SETREQ_RVA));
 
-    HookByRVA("libDARK.so", LIBDARK_SETREQ_RVA,
-              reinterpret_cast<void*>(hooked_libdark_curl_easy_setopt),
-              reinterpret_cast<void**>(&original_libdark_curl_easy_setopt),
-              "libDARK curl_easy_setopt");
+    bool hooked = HookByRVA("libDARK.so", LIBDARK_SETREQ_RVA,
+                            reinterpret_cast<void*>(hooked_libdark_curl_easy_setopt),
+                            reinterpret_cast<void**>(&original_libdark_curl_easy_setopt),
+                            "libDARK curl_easy_setopt");
+    if (!hooked) {
+        LOGW("[RVA:LIBDARK] RVA hook failed; will retry on next watcher pass");
+        attempted.store(false);
+    }
 }
 
 // ============================================================================
@@ -642,7 +650,7 @@ static void scan_and_patch_memory(const char* lib_name) {
         uintptr_t start = 0, end = 0;
         char perms[5] = {0};
         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
-        if (perms[0] != 'r') continue;
+        if (start >= end || perms[0] != 'r') continue;
 
         int prot = 0;
         if (perms[0] == 'r') prot |= PROT_READ;
@@ -655,59 +663,81 @@ static void scan_and_patch_memory(const char* lib_name) {
     if (segments.empty()) return;
 
     std::lock_guard<std::mutex> lock(g_rules_mutex);
-    long page_size = sysconf(_SC_PAGESIZE);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+
+    const uintptr_t page_mask = static_cast<uintptr_t>(page_size) - 1;
 
     for (const auto& seg : segments) {
+        const size_t seg_len = static_cast<size_t>(seg.end - seg.start);
+
         for (const auto& rule : URL_RULES) {
-            if (!rule.enabled) continue;
-            if (rule.pattern.empty() || rule.replacement.empty()) continue;
+            if (!rule.enabled || rule.pattern.empty() || rule.replacement.empty()) continue;
 
-            const char* needle = rule.pattern.c_str();
-            size_t needle_len  = rule.pattern.length();
-            const char* repl   = rule.replacement.c_str();
-            size_t repl_len    = rule.replacement.length();
+            const size_t needle_len = rule.pattern.length();
+            const size_t repl_len   = rule.replacement.length();
+            if (needle_len > seg_len) continue;
 
-            // Search bytes in segment
+            if (repl_len > needle_len) {
+                LOGW("[MEM:PATCH] Replacement '%s' is longer than pattern (%zu > %zu), skipping in-place patch",
+                     rule.replacement.c_str(), repl_len, needle_len);
+                continue;
+            }
+
+            const char* needle  = rule.pattern.c_str();
+            const char* repl    = rule.replacement.c_str();
             const char* current = reinterpret_cast<const char*>(seg.start);
             const char* end_ptr = reinterpret_cast<const char*>(seg.end - needle_len);
 
             while (current <= end_ptr) {
-                if (memcmp(current, needle, needle_len) == 0) {
-                    if (repl_len > needle_len) {
-                        LOGW("[MEM:PATCH] Replacement '%s' is longer than pattern (%zu > %zu), skipping in-place patch",
-                             repl, repl_len, needle_len);
-                        current += needle_len;
-                        continue;
-                    }
-
-                    uintptr_t match_addr = reinterpret_cast<uintptr_t>(current);
-                    uintptr_t page_start = match_addr & ~(page_size - 1);
-                    size_t patch_pages   = page_size * 2;
-
-                    // Grant write permission only when an actual in-place patch fits.
-                    if (mprotect(reinterpret_cast<void*>(page_start), patch_pages,
-                                 PROT_READ | PROT_WRITE) == 0) {
-                        memcpy(reinterpret_cast<void*>(match_addr), repl, repl_len);
-                        if (repl_len < needle_len) {
-                            memset(reinterpret_cast<void*>(match_addr + repl_len), 0,
-                                   needle_len - repl_len);
-                        }
-                        LOGI("[MEM:PATCH] ✓ Hot-patched '%s' -> '%s' at %p in %s",
-                             needle, repl, reinterpret_cast<void*>(match_addr), lib_name);
-
-                        __builtin___clear_cache(reinterpret_cast<char*>(page_start),
-                                               reinterpret_cast<char*>(page_start + patch_pages));
-                        // Restore the ORIGINAL protections (including PROT_EXEC) — restoring
-                        // only PROT_READ here would turn executable pages into non-executable
-                        // ones and crash the app.
-                        mprotect(reinterpret_cast<void*>(page_start), patch_pages, seg.prot);
-                    } else {
-                        LOGE("[MEM:PATCH] mprotect failed at %p", reinterpret_cast<void*>(page_start));
-                    }
-                    current += needle_len;
-                } else {
-                    current++;
+                if (memcmp(current, needle, needle_len) != 0) {
+                    ++current;
+                    continue;
                 }
+
+                const uintptr_t match_addr = reinterpret_cast<uintptr_t>(current);
+                const uintptr_t page_start = match_addr & ~page_mask;
+                const uintptr_t last_byte  = match_addr + needle_len - 1;
+                const uintptr_t page_end   = (last_byte | page_mask) + 1;
+
+                // Never mprotect pages outside this mapping. Touching the next
+                // mapping's page (the old 2-page hack) could strip PROT_EXEC from
+                // unrelated code and cause SIGSEGV/SEGV_ACCERR.
+                if (page_start < seg.start || page_end > seg.end) {
+                    LOGW("[MEM:PATCH] Match at %p crosses segment boundary; skipped",
+                         reinterpret_cast<void*>(match_addr));
+                    current += needle_len;
+                    continue;
+                }
+
+                const size_t patch_len = static_cast<size_t>(page_end - page_start);
+                // Keep executable pages executable while writing; restore exact
+                // original flags afterwards (r-x must not become r--).
+                const int write_prot = seg.prot | PROT_WRITE;
+
+                if (mprotect(reinterpret_cast<void*>(page_start), patch_len, write_prot) == 0) {
+                    memcpy(reinterpret_cast<void*>(match_addr), repl, repl_len);
+                    if (repl_len < needle_len) {
+                        memset(reinterpret_cast<void*>(match_addr + repl_len), 0,
+                               needle_len - repl_len);
+                    }
+
+                    __builtin___clear_cache(reinterpret_cast<char*>(page_start),
+                                            reinterpret_cast<char*>(page_end));
+
+                    if (mprotect(reinterpret_cast<void*>(page_start), patch_len, seg.prot) != 0) {
+                        LOGE("[MEM:PATCH] Failed to restore protection at %p",
+                             reinterpret_cast<void*>(page_start));
+                    }
+
+                    LOGI("[MEM:PATCH] ✓ Hot-patched '%s' -> '%s' at %p in %s",
+                         needle, repl, reinterpret_cast<void*>(match_addr), lib_name);
+                } else {
+                    LOGE("[MEM:PATCH] mprotect failed at %p (%zu bytes)",
+                         reinterpret_cast<void*>(page_start), patch_len);
+                }
+
+                current += needle_len;
             }
         }
     }
@@ -751,33 +781,43 @@ static bool install_curl_hooks_from_handle(void* handle, const char* source_name
 }
 
 static bool check_and_hook_library(const std::string& lib_name) {
-    // 1. Try RTLD_NOLOAD first
+    // Only inspect libraries the app already loaded. Calling dlopen() with
+    // RTLD_NOW on an unloaded target would run its constructors in our process
+    // (libil2cpp/libUE4/etc.) and is a common crash source.
     void* handle = dlopen(lib_name.c_str(), RTLD_NOW | RTLD_NOLOAD);
-    if (!handle) {
-        handle = dlopen(lib_name.c_str(), RTLD_NOW);
-    }
+    if (!handle) return false;
 
-    bool hooked = false;
-    if (handle) {
-        hooked = install_curl_hooks_from_handle(handle, lib_name.c_str());
-    }
+    bool hooked = install_curl_hooks_from_handle(handle, lib_name.c_str());
 
     // libDARK.so has a statically linked curl; hook its internal setopt by RVA.
     if (lib_name.find("libDARK.so") != std::string::npos) {
         install_libdark_rva_hooks();
     }
 
-    // 2. Perform direct in-memory byte patch on the library
+    // Direct in-memory byte patch on the already-loaded library.
     scan_and_patch_memory(lib_name.c_str());
 
+    dlclose(handle); // Drop only the reference we just added.
     return hooked;
 }
 
 // ============================================================================
 // [12] DLOPEN INTERCEPTOR & WATCHER THREAD
 // ============================================================================
+static void* fallback_dlopen(const char* filename, int flags) {
+    static void* (*real_dlopen)(const char*, int) = nullptr;
+    if (!real_dlopen) {
+        real_dlopen = reinterpret_cast<void* (*)(const char*, int)>(
+            dlsym(RTLD_NEXT, "dlopen"));
+    }
+    return real_dlopen ? real_dlopen(filename, flags) : nullptr;
+}
+
 static void* hooked_dlopen(const char* filename, int flags) {
-    void* handle = original_dlopen ? original_dlopen(filename, flags) : nullptr;
+    // If Dobby/A64 failed to capture the original pointer, still let the app
+    // load its library instead of returning nullptr and crashing startup.
+    void* handle = original_dlopen ? original_dlopen(filename, flags)
+                                   : fallback_dlopen(filename, flags);
 
     if (filename && handle) {
         for (const auto& target : TARGET_LIBS) {

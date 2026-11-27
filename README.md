@@ -57,7 +57,9 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 ### 3. In-Memory String Scanner & Hot-Patcher (`mprotect`)
 - Scans all mapped memory pages (`.rodata`, `.data`) of target libraries (`libil2cpp.so`, etc.).
 - Finds byte occurrences of old URLs/domains and directly overwrites them in process memory.
-- Uses `mprotect(PROT_READ | PROT_WRITE)` + cache flush (`__builtin___clear_cache`).
+- **Page-safe:** only the exact pages covering a match are `mprotect`-ed, never a fixed 2-page window that could hit a neighbouring mapping.
+- **W^X-safe:** executable pages keep `PROT_EXEC` while writing, and the original flags (`r-x`, `rw-`, ...) are restored afterwards. This fixes `SIGSEGV / SEGV_ACCERR: trying to execute non-executable memory`.
+- Cache flush (`__builtin___clear_cache`) runs before restoring protections.
 
 ### 4. Crash-Proof Memory Lifecycle Tracking
 - Prevents use-after-free crashes (`SIGSEGV`) by maintaining a thread-safe map of allocated URL strings tied to their `CURL*` handle.
@@ -75,6 +77,13 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 - All redirect rules, target libraries and settings live in `app/src/main/jni/Main.cpp` only.
 - No `/sdcard/url_config.json`, no sample config, no file/env/network dependency — nothing is read at runtime.
 - To change a redirect, edit `URL_RULES` in `Main.cpp` and rebuild `liburlhook.so`.
+
+### 7. Crash Hardening (final pass)
+- **NOLOAD-only scanning:** `check_and_hook_library()` never calls `dlopen()` with `RTLD_NOW` on an unloaded target. Constructors of `libil2cpp.so`, `libUE4.so`, `libmain.so`, etc. are no longer accidentally run inside the host process.
+- **dlopen fallback:** if a hook engine fails to capture the original `dlopen`, `dlsym(RTLD_NEXT, "dlopen")` is used so the app still loads its libraries instead of getting `nullptr`.
+- **Retry-safe RVA hook:** a failed/mismatched `libDARK.so` signature check no longer permanently disables the RVA hook; the watcher retries safely.
+- **Self-hook guard:** the hook dispatcher refuses to hook its own trampoline address.
+- **Empty-rule guard:** empty patterns can never trigger a zero-length replace loop.
 
 ---
 
@@ -119,7 +128,7 @@ static std::vector<UrlRule> URL_RULES = {
 
 ### GitHub Actions (main branch)
 
-`.github/workflows/build-libso.yml` har `push` / `pull_request` par `main` branch ke liye chaaron ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) build karta hai. Output `liburlhook-all-<commit-sha>` artifact ke liye Actions tab se download karo. `workflow_dispatch` se manually bhi chala sakte ho.
+`.github/workflows/build-libso.yml` har `push` / `pull_request` par `main` branch ke liye chaaron ABIs (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) build karta hai. Har build me **standalone linkage check** hota hai (`libc++_shared.so` NEEDED nahi hona chahiye) aur `liburlhook-all-<commit-sha>.zip` bhi banata hai. Output `liburlhook-all-<commit-sha>` artifact Actions tab se download karo. `workflow_dispatch` se manually bhi chala sakte ho.
 
 ### Method A: Termux / Linux Build (ARM64)
 
@@ -157,7 +166,7 @@ ndk-build
 
 2. **Via APK Injection (MT Manager / NP Manager)**:
    - Copy `liburlhook.so` into `lib/arm64-v8a/` inside the APK.
-   - The built `liburlhook.so` needs `libc++_shared.so`; copy it into the same `lib/arm64-v8a/` folder if the APK does not already contain it.
+   - **Self-contained:** `libc++` aur Dobby statically linked hain. Sirf system libs (`libc.so`, `libdl.so`, `liblog.so`, `libm.so`) lagti hain — `libc++_shared.so` copy karne ki zarurat nahi.
    - Inject `const-string v0, "urlhook"` -> `invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V` into `Application.onCreate()` or `MainActivity.onCreate()`.
 
 3. **Monitor Real-Time Logs via Logcat**:

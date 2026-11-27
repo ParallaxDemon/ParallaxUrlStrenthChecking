@@ -71,10 +71,31 @@ jobs:
           echo "=== checksums ==="
           cat artifacts/liburlhook-all/SHA256SUMS
 
+      - name: Verify standalone linkage (no libc++_shared)
+        run: |
+          set -euo pipefail
+          for abi in ${ABI_LIST}; do
+            so="artifacts/liburlhook-all/${abi}/liburlhook.so"
+            if readelf -d "${so}" | grep -q 'libc++_shared'; then
+              echo "ERROR: ${so} still depends on libc++_shared.so" >&2
+              exit 1
+            fi
+            echo "=== ${abi} NEEDED ==="
+            readelf -d "${so}" | grep 'NEEDED'
+          done
+
+      - name: Package standalone bundle
+        run: |
+          set -euo pipefail
+          cd artifacts
+          zip -r "liburlhook-all-${GITHUB_SHA}.zip" liburlhook-all
+
       - name: Upload liburlhook artifacts
         uses: actions/upload-artifact@v4
         with:
           name: liburlhook-all-${{ github.sha }}
-          path: artifacts/liburlhook-all/**
+          path: |
+            artifacts/liburlhook-all/**
+            artifacts/liburlhook-all-*.zip
           retention-days: 30
           if-no-files-found: error
