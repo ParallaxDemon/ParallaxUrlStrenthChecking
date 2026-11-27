@@ -62,7 +62,8 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 - Cache flush (`__builtin___clear_cache`) runs before restoring protections.
 
 ### 4. Crash-Proof Memory Lifecycle Tracking
-- Prevents use-after-free crashes (`SIGSEGV`) by maintaining a thread-safe map of allocated URL strings tied to their `CURL*` handle.
+- Prevents use-after-free crashes (`SIGSEGV`) by tracking allocated URL strings tied to their `CURL*` handle in a fixed-size POD table.
+- No `std::unordered_map` / `std::unordered_set` is used for hook or allocation tracking, so loader-time rehashing cannot throw.
 - Memory is safely released only when `curl_easy_cleanup` is called.
 
 ### 5. Full SSL / TLS Pinning Bypass
@@ -84,6 +85,7 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 - **Retry-safe RVA hook:** a failed/mismatched `libDARK.so` signature check no longer permanently disables the RVA hook; the watcher retries safely.
 - **Self-hook guard:** the hook dispatcher refuses to hook its own trampoline address.
 - **Empty-rule guard:** empty patterns can never trigger a zero-length replace loop.
+- **No ELF constructor init:** the engine starts from `JNI_OnLoad` only. Running it from `__attribute__((constructor))` used to crash inside `call_constructors()` with `std::overflow_error: __next_prime overflow` during `System.loadLibrary()`.
 
 ---
 
