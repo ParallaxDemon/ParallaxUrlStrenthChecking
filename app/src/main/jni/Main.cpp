@@ -87,6 +87,22 @@ static std::vector<UrlRule> URL_RULES = {
         true,
         "Taito -> Darkdevel Auth Endpoint"
     },
+    // Same endpoint with query parameters (key=..., device=..., etc.)
+    {
+        "https://taitogaming.authapi.xyz/server",
+        "https://darkdevel.parallaxserver.online/connect",
+        MatchType::PREFIX,
+        true,
+        "Taito -> Darkdevel Auth Endpoint (with query)"
+    },
+    // Last-resort host/path swap if the URL is assembled differently
+    {
+        "authapi.xyz/server",
+        "darkdevel.parallaxserver.online/connect",
+        MatchType::CONTAINS,
+        true,
+        "Taito auth host -> Darkdevel (contains)"
+    },
     // Rule 0b: Domain fallback for any other path on the old host
     {
         "taitogaming.authapi.xyz",
@@ -147,6 +163,8 @@ static void* (*original_curl_easy_init)() = nullptr;
 static void* (*original_curl_easy_setopt)(void*, int, ...) = nullptr;
 // libDARK.so statically links curl; its internal setopt needs a separate trampoline.
 static void* (*original_libdark_curl_easy_setopt)(void*, int, ...) = nullptr;
+// libDARK+0xe8734 parses the HTTP response body with nlohmann::json.
+static void* (*original_libdark_json_parse)(void*, int, void*) = nullptr;
 static void* (*original_curl_easy_perform)(void*) = nullptr;
 static void  (*original_curl_easy_cleanup)(void*) = nullptr;
 static int   (*original_curl_url_set)(void*, int, const char*, unsigned int) = nullptr;
@@ -505,6 +523,13 @@ static void* hooked_libdark_curl_easy_setopt(void* curl, int option, ...) {
     void* value = va_arg(args, void*);
     va_end(args);
 
+    // Diagnostic: this is the exact call libDARK uses to set its auth URL.
+    // CURLOPT_URL is 10002. Log every URL call even when no rule matches so we
+    // can prove whether the static-curl RVA hook fired before the JSON parse.
+    if (option == 10002 && value != nullptr) {
+        LOGI("[CURL:URL] libDARK CURLOPT_URL = '%.192s'", static_cast<const char*>(value));
+    }
+
     value = rewrite_setopt_value(curl, option, value);
 
     if (!original_libdark_curl_easy_setopt) return nullptr;
@@ -568,6 +593,42 @@ static constexpr uintptr_t LIBDARK_SETREQ_RVA      = 0x126618;
 static constexpr uintptr_t LIBDARK_BLOB_OFFSET     = 0x305e40;
 static constexpr unsigned char LIBDARK_XOR_KEY     = 0x2E;
 static const char LIBDARK_OLD_URL[] = "https://taitogaming.authapi.xyz/server";
+
+// libDARK+0xe8734 receives (owner, flag, std::string* body) and hands the body
+// to nlohmann::parse at +0xeb378. The old auth endpoint now replies with an
+// HTTP 403 HTML page; libDARK converts that to an empty string and aborts with
+// parse_error.101. Replace any non-JSON body with a well-formed response so the
+// mod can never reach that abort, even if the URL hook is installed a moment
+// too late for the request thread.
+static constexpr uintptr_t LIBDARK_JSON_PARSE_RVA = 0xe8734;
+static const char LIBDARK_FALLBACK_JSON[] =
+    "{\"status\":false,\"reason\":\"INVALID PARAMETER\","
+    "\"data\":{\"real\":\"\",\"token\":\"\",\"modname\":\"\","
+    "\"mod_status\":\"\",\"credit\":\"\",\"ESP\":\"off\",\"Item\":\"off\","
+    "\"AIM\":\"off\",\"SilentAim\":\"off\",\"BulletTrack\":\"off\","
+    "\"Floating\":\"off\",\"Memory\":\"off\",\"Setting\":\"off\","
+    "\"expired_date\":\"\",\"EXP\":\"\",\"exdate\":\"\",\"device\":0,"
+    "\"rng\":0}}";
+
+static bool looks_like_json(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size() &&
+           (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) {
+        ++i;
+    }
+    return i < s.size() && (s[i] == '{' || s[i] == '[');
+}
+
+static void* hooked_libdark_json_parse(void* owner, int flag, void* input) {
+    std::string* body = static_cast<std::string*>(input);
+    if (body != nullptr && !looks_like_json(*body)) {
+        LOGI("[JSON:FIX] non-JSON auth response (%zu bytes, '%.96s') -> valid JSON",
+             body->size(), body->c_str());
+        *body = std::string(LIBDARK_FALLBACK_JSON);
+    }
+    return original_libdark_json_parse ?
+           original_libdark_json_parse(owner, flag, input) : nullptr;
+}
 
 static std::string get_library_path(const char* lib_name) {
     FILE* fp = fopen("/proc/self/maps", "re");
@@ -656,6 +717,11 @@ static void install_libdark_rva_hooks() {
         LOGW("[RVA:LIBDARK] RVA hook failed; will retry on next watcher pass");
         attempted.store(false);
     }
+
+    HookByRVA("libDARK.so", LIBDARK_JSON_PARSE_RVA,
+              reinterpret_cast<void*>(hooked_libdark_json_parse),
+              reinterpret_cast<void**>(&original_libdark_json_parse),
+              "libDARK json decode");
 }
 
 // ============================================================================
@@ -989,9 +1055,12 @@ static void init_engine() {
 // library loaded before libDARK.so. ART calls JNI_OnLoad for it, so all hooks
 // are active before libDARK.so starts its JSON/auth thread.
 //
-// The original libPHOENIX.so is deliberately NOT forwarded. On this repackaged
-// APK its signature check makes libDARK.so parse an empty JSON string and abort
-// with nlohmann::parse_error.101. Taking over its load slot keeps the app alive.
+// The original libPHOENIX.so is deliberately NOT forwarded: the first app
+// library load slot belongs to this hook so it is installed before libDARK.so.
+// Note: the parse_error.101 crash is inherent to the Taito mod itself (its
+// authapi.xyz endpoint returns 403 HTML that libDARK parses as JSON). The
+// JSON-body fallback hook above neutralizes that crash without touching APK
+// libraries.
 
 // IMPORTANT: no __attribute__((constructor)) here. Running the hooking engine
 // from the ELF constructor executes during the linker's call_constructors(),
