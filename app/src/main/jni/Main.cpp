@@ -155,6 +155,7 @@ static void  (*original_curl_easy_cleanup)(void*) = nullptr;
 static int   (*original_curl_url_set)(void*, int, const char*, unsigned int) = nullptr;
 
 static void* (*original_dlopen)(const char*, int) = nullptr;
+static void* (*original_android_dlopen_ext)(const char*, int, const void*) = nullptr;
 static int   (*original_getaddrinfo)(const char*, const char*, const struct addrinfo*, struct addrinfo**) = nullptr;
 static struct hostent* (*original_gethostbyname)(const char*) = nullptr;
 
@@ -848,26 +849,46 @@ static void* fallback_dlopen(const char* filename, int flags) {
     return real_dlopen ? real_dlopen(filename, flags) : nullptr;
 }
 
+static void notify_library_loaded(const char* filename, void* handle) {
+    if (!filename || !handle) return;
+    for (const auto& target : TARGET_LIBS) {
+        if (strstr(filename, target.c_str()) != nullptr) {
+            LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
+            install_curl_hooks_from_handle(handle, filename);
+            if (target == "libDARK.so") {
+                install_libdark_rva_hooks();
+            }
+            scan_and_patch_memory(target.c_str());
+            break;
+        }
+    }
+}
+
 static void* hooked_dlopen(const char* filename, int flags) {
     // If Dobby/A64 failed to capture the original pointer, still let the app
     // load its library instead of returning nullptr and crashing startup.
     void* handle = original_dlopen ? original_dlopen(filename, flags)
                                    : fallback_dlopen(filename, flags);
 
-    if (filename && handle) {
-        for (const auto& target : TARGET_LIBS) {
-            if (strstr(filename, target.c_str()) != nullptr) {
-                LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
-                install_curl_hooks_from_handle(handle, filename);
-                if (target == "libDARK.so") {
-                    install_libdark_rva_hooks();
-                }
-                scan_and_patch_memory(target.c_str());
-                break;
-            }
-        }
-    }
+    notify_library_loaded(filename, handle);
+    return handle;
+}
 
+static void* fallback_android_dlopen_ext(const char* filename, int flags, const void* ext) {
+    using Fn = void* (*)(const char*, int, const void*);
+    static Fn real_fn = nullptr;
+    if (!real_fn) {
+        real_fn = reinterpret_cast<Fn>(dlsym(RTLD_NEXT, "android_dlopen_ext"));
+    }
+    return real_fn ? real_fn(filename, flags, ext) : nullptr;
+}
+
+static void* hooked_android_dlopen_ext(const char* filename, int flags, const void* ext) {
+    void* handle = original_android_dlopen_ext
+                       ? original_android_dlopen_ext(filename, flags, ext)
+                       : fallback_android_dlopen_ext(filename, flags, ext);
+
+    notify_library_loaded(filename, handle);
     return handle;
 }
 
@@ -876,6 +897,12 @@ static void install_dlopen_hook() {
     if (dlopen_addr) {
         UnifiedHook(dlopen_addr, (void*)hooked_dlopen, (void**)&original_dlopen, "dlopen");
     }
+
+    void* ext_addr = dlsym(RTLD_DEFAULT, "android_dlopen_ext");
+    if (ext_addr) {
+        UnifiedHook(ext_addr, (void*)hooked_android_dlopen_ext,
+                    (void**)&original_android_dlopen_ext, "android_dlopen_ext");
+    }
 }
 
 // Background watcher checks /proc/self/maps periodically
@@ -883,8 +910,10 @@ static void* background_watcher_thread(void*) {
     LOGI("[WATCHER] Background engine monitor started");
 
     int scan_count = 0;
-    while (scan_count < 150) { // Scan for up to 75 seconds
-        usleep(500 * 1000);   // 500ms
+    while (scan_count < 4000) {
+        // libDARK.so can spawn its JSON/auth thread within ~15 ms of being
+        // loaded. Poll every 1 ms during startup, then back off to 500 ms.
+        usleep(scan_count < 2000 ? 1000 : 500 * 1000);
         scan_count++;
 
         FILE* fp = fopen("/proc/self/maps", "re");
