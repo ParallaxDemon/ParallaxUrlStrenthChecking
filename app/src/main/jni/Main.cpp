@@ -606,6 +606,12 @@ static constexpr uintptr_t LIBDARK_JSON_PARSE_RVA = 0xe8734;
 // Second line of defence when a caller enters the parser through a path that
 // does not pass through the 0xe8734 entry point.
 static constexpr uintptr_t LIBDARK_PARSE_RVA = 0xeb378;
+// libDARK+0xeb81c: `cbz w8, 0xeb8fc` decides whether a parse error throws.
+// The mod leaves the throw flag set even for its own empty input, which ends in
+// __cxa_throw at 0xeb880 and SIGABRT. Replace it with `b 0xeb8fc` so parse
+// errors take the library's own graceful cleanup/return path instead.
+static constexpr uintptr_t LIBDARK_THROW_BRANCH_RVA = 0xeb81c;
+static constexpr uint32_t LIBDARK_THROW_BRANCH_PATCH = 0x14000038; // b +0xe0
 static const char LIBDARK_FALLBACK_JSON[] =
     "{\"status\":false,\"reason\":\"INVALID PARAMETER\","
     "\"data\":{\"real\":\"\",\"token\":\"\",\"modname\":\"\","
@@ -708,6 +714,32 @@ static bool verify_libdark_build(const std::string& path) {
     return read_bytes == sizeof(actual) && memcmp(actual, expected, sizeof(expected)) == 0;
 }
 
+static void patch_libdark_throw_branch() {
+    uintptr_t base = get_library_base("libDARK.so");
+    if (!base) return;
+    uintptr_t addr = base + LIBDARK_THROW_BRANCH_RVA;
+    uint32_t* target = reinterpret_cast<uint32_t*>(addr);
+    if (*target == LIBDARK_THROW_BRANCH_PATCH) return; // Already patched.
+
+    long ps = sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    uintptr_t page = addr & ~static_cast<uintptr_t>(ps - 1);
+    size_t span = (addr + sizeof(uint32_t) - page + static_cast<size_t>(ps) - 1) &
+                  ~static_cast<size_t>(ps - 1);
+    if (mprotect(reinterpret_cast<void*>(page), span,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGW("[PATCH:THROW] mprotect failed at %p", reinterpret_cast<void*>(page));
+        return;
+    }
+    *target = LIBDARK_THROW_BRANCH_PATCH;
+    __builtin___clear_cache(reinterpret_cast<char*>(addr),
+                            reinterpret_cast<char*>(addr + sizeof(uint32_t)));
+    mprotect(reinterpret_cast<void*>(page), span, PROT_READ | PROT_EXEC);
+    LOGI("[PATCH:THROW] libDARK+0x%lx -> %08x at %p",
+         static_cast<unsigned long>(LIBDARK_THROW_BRANCH_RVA), *target,
+         static_cast<const void*>(target));
+}
+
 static void install_libdark_rva_hooks() {
     static std::atomic<bool> attempted(false);
 
@@ -750,6 +782,8 @@ static void install_libdark_rva_hooks() {
               reinterpret_cast<void*>(hooked_libdark_parse),
               reinterpret_cast<void**>(&original_libdark_parse),
               "libDARK nlohmann parse");
+
+    patch_libdark_throw_branch();
 }
 
 // Diagnostic: dump the first instruction words at the patched RVAs so the log
