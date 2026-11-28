@@ -20,7 +20,7 @@ LOCAL_CPPFLAGS += -fexceptions
 LOCAL_CPPFLAGS += -Wno-error=format-security -fvisibility=hidden -ffunction-sections -fdata-sections -w
 LOCAL_CPPFLAGS += -fms-extensions -fno-rtti -fpermissive
 
-LOCAL_LDLIBS := -llog -ldl -lz
+LOCAL_LDLIBS := -llog -ldl
 LOCAL_LDFLAGS := -Wl,--gc-sections -Wl,--strip-all
 
 LOCAL_ARM_MODE := arm

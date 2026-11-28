@@ -86,7 +86,7 @@ It provides a **5-Layer Redirection Pipeline** designed to intercept, rewrite, a
 - **Self-hook guard:** the hook dispatcher refuses to hook its own trampoline address.
 - **Empty-rule guard:** empty patterns can never trigger a zero-length replace loop.
 - **No ELF constructor init:** the engine starts from `JNI_OnLoad` only. Running it from `__attribute__((constructor))` used to crash inside `call_constructors()` with `std::overflow_error: __next_prime overflow` during `System.loadLibrary()`.
-- **Early-load proxy:** naming the output `libsigner.so` loaded the hook about 2 seconds *after* `libDARK.so` had already aborted on an empty JSON response. The binary is now installed as `libPHOENIX.so` — the first app library loaded before `libDARK.so` — and its `JNI_OnLoad` installs hooks before `libDARK.so` starts. The original `libPHOENIX.so` must be kept as `libPHOENIX_orig.so` beside it; the proxy `dlopen`s it and forwards `JNI_OnLoad` (when exported). If the sidecar is absent, the proxy tries to extract `lib/arm64-v8a/libPHOENIX_orig.so` from the installed APK into the app's `files/` directory.
+- **Early-load slot:** naming the output `libsigner.so` loaded the hook about 2 seconds *after* `libDARK.so` had already aborted on an empty JSON response. The binary is now installed as `libPHOENIX.so` — the first app library loaded before `libDARK.so` — and its `JNI_OnLoad` installs hooks before `libDARK.so` starts. The original `libPHOENIX.so` is deliberately not forwarded: on a repackaged APK its signature check makes `libDARK.so` parse an empty JSON string and abort with `nlohmann::parse_error.101`. Taking over that load slot keeps the app alive.
 
 ---
 
@@ -171,28 +171,27 @@ ndk-build
 
 | File | What it is |
 |---|---|
-| `libPHOENIX.so` | **Our hook binary.** Rename the built `liburlhook.so` to this. |
-| `libPHOENIX_orig.so` | The original `libPHOENIX.so` from the app, renamed. The proxy loads it so app behaviour is unchanged. |
+| `libPHOENIX.so` | **Our hook binary.** Rename the built `liburlhook.so` to this and replace the original. |
 | `libsigner.so` | Leave the app's original Adjust SDK library untouched. Do **not** put the hook here anymore. |
 
 Why: `libPHOENIX.so` is loaded before `libDARK.so`. ART calls our `JNI_OnLoad` at that point, so DNS/`dlopen`/curl hooks are installed before `libDARK.so` parses its auth JSON. With the old `libsigner.so` name the hook arrived ~2 seconds too late and `libDARK.so` aborted with `nlohmann::parse_error.101`.
 
-If `libPHOENIX_orig.so` is missing, the proxy tries `lib/arm64-v8a/libPHOENIX_orig.so` from the APK and extracts it into `/data/user/0/<package>/files/`. Keeping the sidecar is still recommended.
+The original `libPHOENIX.so` is intentionally not loaded. Its signature check on a repackaged APK is what feeds an empty JSON string to `libDARK.so`; forwarding it reintroduces the same crash. Keeping only our binary in that slot avoids the abort.
 
 1. **Via APK Injection (MT Manager / NP Manager)**
    - Replace `lib/arm64-v8a/libPHOENIX.so` with the built `liburlhook.so` (renamed).
-   - Add a copy of the original as `lib/arm64-v8a/libPHOENIX_orig.so`.
    - Keep the original `libsigner.so` as-is.
+   - Do not add a `libPHOENIX_orig.so` sidecar.
    - No smali `System.loadLibrary` patch is needed — the app already loads `PHOENIX`.
 
 2. **Standalone linkage**
-   - `libc++` and Dobby are statically linked. NEEDED entries are only system libraries: `liblog.so`, `libdl.so`, `libc.so`, `libm.so`, `libz.so` (`libz` is used only for the optional APK-entry extraction). `libc++_shared.so` is never required.
+   - `libc++` and Dobby are statically linked. NEEDED entries are only system libraries: `liblog.so`, `libdl.so`, `libc.so`, `libm.so`. `libc++_shared.so` is never required.
 
 3. **Monitor Real-Time Logs via Logcat**
    ```bash
    adb logcat -s URL_HOOK
    ```
-   You should see `[JNI] JNI_OnLoad called` and `[PHOENIX:PROXY] Loaded real libPHOENIX ...` **before** the `libDARK.so` load line. The old `parse_error.101` abort should no longer happen.
+   You should see `[JNI] JNI_OnLoad called` **before** the `libDARK.so` load line. The old `parse_error.101` abort should no longer happen.
 
 ---
 
