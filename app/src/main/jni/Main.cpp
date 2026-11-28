@@ -724,6 +724,22 @@ static void install_libdark_rva_hooks() {
               "libDARK json decode");
 }
 
+// Diagnostic: dump the first instruction words at the patched RVAs so the log
+// proves whether Dobby's branch is still in place when the parse thread runs.
+static void log_libdark_patch_bytes(const char* when) {
+    uintptr_t base = get_library_base("libDARK.so");
+    if (!base) return;
+    struct Pair { const char* name; uintptr_t rva; } sites[] = {
+        {"curl", LIBDARK_SETREQ_RVA}, {"json", LIBDARK_JSON_PARSE_RVA}
+    };
+    for (const auto& site : sites) {
+        const uint32_t* word = reinterpret_cast<const uint32_t*>(base + site.rva);
+        LOGI("[PATCH:%s] libDARK+0x%lx (%p): %08x %08x", when,
+             static_cast<unsigned long>(site.rva), static_cast<const void*>(word),
+             word[0], word[1]);
+    }
+}
+
 // ============================================================================
 // [10] LAYER 3: DIRECT IN-MEMORY STRING SCANNER & HOT-PATCHER
 // ============================================================================
@@ -920,6 +936,7 @@ static void notify_library_loaded(const char* filename, void* handle) {
             install_curl_hooks_from_handle(handle, filename);
             if (target == "libDARK.so") {
                 install_libdark_rva_hooks();
+                log_libdark_patch_bytes("dlopen");
             }
             scan_and_patch_memory(target.c_str());
             break;
@@ -955,6 +972,28 @@ static void* hooked_android_dlopen_ext(const char* filename, int flags, const vo
     return handle;
 }
 
+// libDARK spawns its auth/JSON thread from inside dlopen(), so RVA hooks
+// installed after dlopen returns are already too late: the thread can call
+// curl_easy_setopt and enter the JSON parser before our patches exist.
+// Hooking pthread_create lets us patch libDARK BEFORE that thread starts.
+static int (*original_pthread_create)(pthread_t*, const pthread_attr_t*,
+                                      void* (*)(void*), void*) = nullptr;
+
+static int hooked_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
+                                 void* (*start_routine)(void*), void* arg) {
+    if (start_routine != nullptr && get_library_base("libDARK.so") != 0) {
+        uintptr_t base = get_library_base("libDARK.so");
+        uintptr_t entry = reinterpret_cast<uintptr_t>(start_routine);
+        LOGI("[PTHREAD:HOOK] new thread entry %p (libDARK base %p, offset +0x%lx)",
+             start_routine, reinterpret_cast<void*>(base),
+             static_cast<unsigned long>(entry > base ? entry - base : 0));
+        install_libdark_rva_hooks();
+    }
+    return original_pthread_create
+               ? original_pthread_create(thread, attr, start_routine, arg)
+               : -1;
+}
+
 static void install_dlopen_hook() {
     void* dlopen_addr = dlsym(RTLD_DEFAULT, "dlopen");
     if (dlopen_addr) {
@@ -965,6 +1004,12 @@ static void install_dlopen_hook() {
     if (ext_addr) {
         UnifiedHook(ext_addr, (void*)hooked_android_dlopen_ext,
                     (void**)&original_android_dlopen_ext, "android_dlopen_ext");
+    }
+
+    void* create_addr = dlsym(RTLD_DEFAULT, "pthread_create");
+    if (create_addr) {
+        UnifiedHook(create_addr, (void*)hooked_pthread_create,
+                    (void**)&original_pthread_create, "pthread_create");
     }
 }
 
@@ -996,6 +1041,10 @@ static void* background_watcher_thread(void*) {
 
         for (const auto& lib : found_libs) {
             check_and_hook_library(lib);
+        }
+
+        if ((scan_count % 100) == 0 && found_libs.count("libDARK.so") != 0) {
+            log_libdark_patch_bytes("watch");
         }
 
         if (original_curl_easy_setopt != nullptr) {
@@ -1061,6 +1110,22 @@ static void init_engine() {
 // authapi.xyz endpoint returns 403 HTML that libDARK parses as JSON). The
 // JSON-body fallback hook above neutralizes that crash without touching APK
 // libraries.
+
+// Compatibility shim: the app calls this JNI method on the library that owns
+// the libPHOENIX.so slot. The original Taito libPHOENIX.so exported it; log
+// the arguments so the redirect strings remain visible, then return safely.
+extern "C" JNIEXPORT void JNICALL
+Java_com_pandora_core_AppFactory_initRedirect(JNIEnv* env, jclass clazz,
+                                              jstring one, jstring two) {
+    (void)clazz;
+    if (VERBOSE_LOGS && env != nullptr) {
+        const char* s1 = one ? env->GetStringUTFChars(one, nullptr) : nullptr;
+        const char* s2 = two ? env->GetStringUTFChars(two, nullptr) : nullptr;
+        LOGI("[JNI:initRedirect] '%s' | '%s'", s1 ? s1 : "(null)", s2 ? s2 : "(null)");
+        if (s1) env->ReleaseStringUTFChars(one, s1);
+        if (s2) env->ReleaseStringUTFChars(two, s2);
+    }
+}
 
 // IMPORTANT: no __attribute__((constructor)) here. Running the hooking engine
 // from the ELF constructor executes during the linker's call_constructors(),
