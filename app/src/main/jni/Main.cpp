@@ -152,9 +152,14 @@ static std::mutex g_rules_mutex;
 // ============================================================================
 static bool FORCE_HTTPS = true;           // Auto convert http:// to https://
 static bool FORCE_SSL_BYPASS = true;      // Bypass SSL certificate and hostname verification
-static bool VERBOSE_LOGS = true;          // Detailed Logcat output (Tag: URL_HOOK)
+static bool VERBOSE_LOGS = false;         // Detailed Logcat output (Tag: URL_HOOK)
 static bool ENABLE_DNS_HOOK = true;       // Intercept getaddrinfo / gethostbyname
-static bool ENABLE_MEMORY_PATCH = true;   // Direct in-memory byte scanner & patcher
+// Disabled: every configured replacement is longer than its obfuscated
+// pattern, so the scanner never changed a byte. Worse, libanogs.so is loaded
+// and unloaded repeatedly while the scanner walks a /proc/self/maps snapshot;
+// scanning a segment that has since been unmapped caused SIGSEGV ~1.7s after
+// launch. URL rewriting is handled by the hooks below instead.
+static bool ENABLE_MEMORY_PATCH = false;  // Direct in-memory byte scanner & patcher
 
 // ============================================================================
 // [4] ORIGINAL FUNCTION POINTERS
@@ -633,16 +638,20 @@ static bool looks_like_json(const std::string& s) {
 static void* hooked_libdark_json_parse(void* owner, int flag, void* input) {
     std::string* body = static_cast<std::string*>(input);
     if (body != nullptr) {
-        LOGI("[JSON:ENTER] body=%p size=%zu first='%.48s'",
-             body, body->size(), body->c_str());
+        if (VERBOSE_LOGS) {
+            LOGI("[JSON:ENTER] body=%p size=%zu first='%.48s'",
+                 body, body->size(), body->c_str());
+        }
         if (!looks_like_json(*body)) {
             LOGI("[JSON:FIX] non-JSON auth response (%zu bytes, '%.96s') -> valid JSON",
                  body->size(), body->c_str());
             *body = std::string(LIBDARK_FALLBACK_JSON);
-            LOGI("[JSON:FIX] now %zu bytes, first='%.48s'",
-                 body->size(), body->c_str());
+            if (VERBOSE_LOGS) {
+                LOGI("[JSON:FIX] now %zu bytes, first='%.48s'",
+                     body->size(), body->c_str());
+            }
         }
-    } else {
+    } else if (VERBOSE_LOGS) {
         LOGW("[JSON:ENTER] null body");
     }
     return original_libdark_json_parse ?
@@ -650,7 +659,7 @@ static void* hooked_libdark_json_parse(void* owner, int flag, void* input) {
 }
 
 static void* hooked_libdark_parse(void* owner, void* state) {
-    if (state != nullptr) {
+    if (state != nullptr && VERBOSE_LOGS) {
         uintptr_t* words = static_cast<uintptr_t*>(state);
         LOGI("[PARSE:ENTER] state=%p words=%p %p %p %p", state,
              reinterpret_cast<void*>(words[0]), reinterpret_cast<void*>(words[1]),
@@ -994,11 +1003,12 @@ static void notify_library_loaded(const char* filename, void* handle) {
     if (!filename || !handle) return;
     for (const auto& target : TARGET_LIBS) {
         if (strstr(filename, target.c_str()) != nullptr) {
-            LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
+            if (VERBOSE_LOGS) {
+                LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
+            }
             install_curl_hooks_from_handle(handle, filename);
             if (target == "libDARK.so") {
                 install_libdark_rva_hooks();
-                log_libdark_patch_bytes("dlopen");
             }
             scan_and_patch_memory(target.c_str());
             break;
@@ -1046,9 +1056,11 @@ static int hooked_pthread_create(pthread_t* thread, const pthread_attr_t* attr,
     if (start_routine != nullptr && get_library_base("libDARK.so") != 0) {
         uintptr_t base = get_library_base("libDARK.so");
         uintptr_t entry = reinterpret_cast<uintptr_t>(start_routine);
-        LOGI("[PTHREAD:HOOK] new thread entry %p (libDARK base %p, offset +0x%lx)",
-             start_routine, reinterpret_cast<void*>(base),
-             static_cast<unsigned long>(entry > base ? entry - base : 0));
+        if (VERBOSE_LOGS) {
+            LOGI("[PTHREAD:HOOK] new thread entry %p (libDARK base %p, offset +0x%lx)",
+                 start_routine, reinterpret_cast<void*>(base),
+                 static_cast<unsigned long>(entry > base ? entry - base : 0));
+        }
         install_libdark_rva_hooks();
     }
     return original_pthread_create
@@ -1103,10 +1115,6 @@ static void* background_watcher_thread(void*) {
 
         for (const auto& lib : found_libs) {
             check_and_hook_library(lib);
-        }
-
-        if ((scan_count % 100) == 0 && found_libs.count("libDARK.so") != 0) {
-            log_libdark_patch_bytes("watch");
         }
 
         if (original_curl_easy_setopt != nullptr) {
