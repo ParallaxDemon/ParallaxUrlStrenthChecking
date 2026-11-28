@@ -27,6 +27,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/system_properties.h>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -160,6 +161,19 @@ static bool ENABLE_DNS_HOOK = true;       // Intercept getaddrinfo / gethostbyna
 // scanning a segment that has since been unmapped caused SIGSEGV ~1.7s after
 // launch. URL rewriting is handled by the hooks below instead.
 static bool ENABLE_MEMORY_PATCH = false;  // Direct in-memory byte scanner & patcher
+
+// Diagnostic switch (debug builds only): when set, install ONLY the libDARK
+// throw-branch patch and skip all function hooks. Used to determine whether a
+// late anti-tamper SIGSEGV comes from our hooks or from the mod itself.
+static bool minimal_diagnostic_mode() {
+    static int cached = -1;
+    if (cached < 0) {
+        char value[8] = {0};
+        cached = __system_property_get("debug.phoenix.minimal", value) > 0 &&
+                 value[0] == '1';
+    }
+    return cached != 0;
+}
 
 // ============================================================================
 // [4] ORIGINAL FUNCTION POINTERS
@@ -752,6 +766,11 @@ static void patch_libdark_throw_branch() {
 static void install_libdark_rva_hooks() {
     static std::atomic<bool> attempted(false);
 
+    if (minimal_diagnostic_mode()) {
+        patch_libdark_throw_branch();
+        return;
+    }
+
     bool expected = false;
     if (!attempted.compare_exchange_strong(expected, true)) return;
 
@@ -967,6 +986,13 @@ static bool install_curl_hooks_from_handle(void* handle, const char* source_name
 }
 
 static bool check_and_hook_library(const std::string& lib_name) {
+    if (minimal_diagnostic_mode()) {
+        if (lib_name.find("libDARK.so") != std::string::npos) {
+            patch_libdark_throw_branch();
+        }
+        return true;
+    }
+
     // Only inspect libraries the app already loaded. Calling dlopen() with
     // RTLD_NOW on an unloaded target would run its constructors in our process
     // (libil2cpp/libUE4/etc.) and is a common crash source.
@@ -1006,7 +1032,9 @@ static void notify_library_loaded(const char* filename, void* handle) {
             if (VERBOSE_LOGS) {
                 LOGI("[DLOPEN:DETECTED] Loaded: %s (%p)", filename, handle);
             }
-            install_curl_hooks_from_handle(handle, filename);
+            if (!minimal_diagnostic_mode()) {
+                install_curl_hooks_from_handle(handle, filename);
+            }
             if (target == "libDARK.so") {
                 install_libdark_rva_hooks();
             }
@@ -1146,13 +1174,15 @@ static void init_engine() {
     LOGI("=================================================");
 
     // 1. Install libc DNS hooks (getaddrinfo, gethostbyname)
-    install_dns_hooks();
+    if (!minimal_diagnostic_mode()) {
+        install_dns_hooks();
+    }
 
     // 2. Hook dlopen to intercept newly loaded libraries
     install_dlopen_hook();
 
     // 3. Hook global curl symbols immediately
-    if (HOOK_GLOBAL_CURL) {
+    if (HOOK_GLOBAL_CURL && !minimal_diagnostic_mode()) {
         install_curl_hooks_from_handle(RTLD_DEFAULT, "Global/RTLD_DEFAULT");
     }
 
