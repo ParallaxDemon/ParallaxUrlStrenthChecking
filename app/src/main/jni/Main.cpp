@@ -543,6 +543,8 @@ static void* hooked_libdark_curl_easy_setopt(void* curl, int option, ...) {
     void* value = va_arg(args, void*);
     va_end(args);
 
+    LOGI("[LIBCURL:ENTER] option=%d value=%p", option, value);
+
     // Diagnostic: this is the exact call libDARK uses to set its auth URL.
     // CURLOPT_URL is 10002. Log every URL call even when no rule matches so we
     // can prove whether the static-curl RVA hook fired before the JSON parse.
