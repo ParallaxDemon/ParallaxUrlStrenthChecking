@@ -80,6 +80,15 @@ jobs:
               echo "ERROR: ${so} still depends on libc++_shared.so" >&2
               exit 1
             fi
+
+            allowed='liblog.so libdl.so libc.so libm.so libz.so'
+            for needed in $(readelf -d "${so}" | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+              if ! printf '%s\n' ${allowed} | grep -qx "${needed}"; then
+                echo "ERROR: ${so} has unexpected NEEDED entry: ${needed}" >&2
+                exit 1
+              fi
+            done
+
             echo "=== ${abi} NEEDED ==="
             readelf -d "${so}" | grep 'NEEDED'
           done

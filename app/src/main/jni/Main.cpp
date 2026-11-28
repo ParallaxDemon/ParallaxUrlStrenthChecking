@@ -11,6 +11,8 @@
  *   [Layer 4] Dual Hooking Engines: Dobby + And64InlineHook hybrid fallback
  *   [Layer 5] Hard-coded rules only: all URLs live in this C++ file (no config file / dependency)
  *   [Hardening] Page-safe mprotect, NOLOAD-only scans, dlopen fallback, retry-safe RVA hooks
+ *   [Early load] Ships as libPHOENIX.so; starts from JNI_OnLoad before libDARK.so and
+ *                forwards to the real libPHOENIX_orig.so so app behaviour is preserved.
  * ============================================================================
  */
 
@@ -25,6 +27,9 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <zlib.h>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -951,6 +956,235 @@ static void init_engine() {
     pthread_detach(thread);
 }
 
+// ============================================================================
+// [15] EARLY-LOAD PHOENIX PROXY
+// ============================================================================
+// This binary is installed as libPHOENIX.so because that is the first app
+// library loaded before libDARK.so. ART calls JNI_OnLoad for it, so the hook
+// engine is active before libDARK.so can parse its auth/config JSON.
+//
+// The real libPHOENIX.so must be preserved as libPHOENIX_orig.so next to this
+// file. We dlopen it and forward JNI_OnLoad (when exported) so the app keeps
+// its original behaviour. If the sidecar is missing, we try to extract the
+// original from the installed APK before giving up.
+static uint16_t le16(const unsigned char* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+
+static uint32_t le32(const unsigned char* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static bool find_module_path(const char* needle, char* out, size_t out_len) {
+    FILE* fp = fopen("/proc/self/maps", "re");
+    if (!fp) return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        const char* hit = strstr(line, needle);
+        if (!hit) continue;
+        const char* start = hit;
+        while (start > line && start[-1] != ' ') --start;
+        size_t len = strcspn(start, "\r\n");
+        if (len == 0 || len >= out_len) continue;
+        memcpy(out, start, len);
+        out[len] = '\0';
+        found = true;
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
+static std::string get_process_package_name() {
+    char buf[256] = {0};
+    FILE* fp = fopen("/proc/self/cmdline", "rb");
+    if (fp) {
+        size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[n] = '\0';
+        fclose(fp);
+    }
+    return std::string(buf);
+}
+
+static bool extract_apk_entry(const char* apk_path, const char* entry, const char* out_path) {
+    FILE* fp = fopen(apk_path, "rb");
+    if (!fp) return false;
+
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return false; }
+    long file_size = ftell(fp);
+    if (file_size < 22) { fclose(fp); return false; }
+    if (fseek(fp, 0, SEEK_SET) != 0) { fclose(fp); return false; }
+
+    const long tail_len = file_size < 65557 ? file_size : 65557;
+    std::vector<unsigned char> tail(static_cast<size_t>(tail_len));
+    if (fread(tail.data(), 1, tail.size(), fp) != tail.size()) {
+        fclose(fp);
+        return false;
+    }
+
+    long eocd = -1;
+    for (long i = tail_len - 22; i >= 0; --i) {
+        if (memcmp(tail.data() + i, "PK\x05\x06", 4) == 0) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd < 0) { fclose(fp); return false; }
+
+    const unsigned char* e = tail.data() + eocd;
+    uint32_t entries = le16(e + 10);
+    uint32_t cd_off = le32(e + 16);
+
+    if (fseek(fp, static_cast<long>(cd_off), SEEK_SET) != 0) {
+        fclose(fp);
+        return false;
+    }
+
+    for (uint32_t idx = 0; idx < entries; ++idx) {
+        unsigned char h[46];
+        if (fread(h, 1, sizeof(h), fp) != sizeof(h)) break;
+        if (memcmp(h, "PK\x01\x02", 4) != 0) break;
+
+        uint16_t method = le16(h + 10);
+        uint32_t comp_size = le32(h + 20);
+        uint32_t uncomp_size = le32(h + 24);
+        uint16_t name_len = le16(h + 28);
+        uint16_t extra_len = le16(h + 30);
+        uint16_t comment_len = le16(h + 32);
+        uint32_t local_off = le32(h + 42);
+
+        std::string name(name_len, '\0');
+        if (name_len && fread(&name[0], 1, name_len, fp) != name_len) break;
+        if (fseek(fp, extra_len + comment_len, SEEK_CUR) != 0) break;
+
+        if (name != entry) continue;
+
+        if (fseek(fp, static_cast<long>(local_off), SEEK_SET) != 0) break;
+        unsigned char lh[30];
+        if (fread(lh, 1, sizeof(lh), fp) != sizeof(lh)) break;
+        if (memcmp(lh, "PK\x03\x04", 4) != 0) break;
+        uint16_t local_name_len = le16(lh + 26);
+        uint16_t local_extra_len = le16(lh + 28);
+        if (fseek(fp, local_name_len + local_extra_len, SEEK_CUR) != 0) break;
+
+        std::vector<unsigned char> comp(comp_size);
+        if (comp_size && fread(comp.data(), 1, comp_size, fp) != comp_size) break;
+        std::vector<unsigned char> plain(uncomp_size);
+
+        bool ok = false;
+        if (method == 0) {
+            ok = (comp_size == uncomp_size);
+            if (ok && uncomp_size) memcpy(plain.data(), comp.data(), uncomp_size);
+        } else if (method == 8) {
+            uLongf dest_len = static_cast<uLongf>(uncomp_size);
+            ok = (uncompress(plain.data(), &dest_len, comp.data(),
+                             static_cast<uLong>(comp_size)) == Z_OK &&
+                  dest_len == uncomp_size);
+        }
+
+        if (ok) {
+            FILE* out = fopen(out_path, "wb");
+            if (out) {
+                if (uncomp_size == 0 || fwrite(plain.data(), 1, uncomp_size, out) == uncomp_size) {
+                    fclose(out);
+                    chmod(out_path, 0700);
+                    fclose(fp);
+                    return true;
+                }
+                fclose(out);
+            }
+        }
+        break;
+    }
+
+    fclose(fp);
+    return false;
+}
+
+static void forward_jni_on_load(void* handle, JavaVM* vm) {
+    using JniOnLoadFn = jint (*)(JavaVM*, void*);
+    JniOnLoadFn fn = reinterpret_cast<JniOnLoadFn>(dlsym(handle, "JNI_OnLoad"));
+    if (!fn) {
+        LOGI("[PHOENIX:PROXY] Real libPHOENIX has no JNI_OnLoad export");
+        return;
+    }
+    jint version = fn(vm, nullptr);
+    LOGI("[PHOENIX:PROXY] Forwarded JNI_OnLoad -> 0x%x", static_cast<unsigned>(version));
+}
+
+static void load_real_phoenix(JavaVM* vm) {
+    char self_path[512] = {0};
+    if (!find_module_path("libPHOENIX.so", self_path, sizeof(self_path))) {
+        LOGE("[PHOENIX:PROXY] Cannot locate own module path; skipping real library");
+        return;
+    }
+
+    std::string dir(self_path);
+    size_t slash = dir.rfind('/');
+    if (slash != std::string::npos) dir.resize(slash + 1);
+    std::string sidecar = dir + "libPHOENIX_orig.so";
+
+    void* handle = dlopen(sidecar.c_str(), RTLD_NOW);
+    if (handle) {
+        LOGI("[PHOENIX:PROXY] Loaded real libPHOENIX from sidecar: %s", sidecar.c_str());
+        forward_jni_on_load(handle, vm);
+        return;
+    }
+    LOGW("[PHOENIX:PROXY] Sidecar not found (%s); trying APK extraction", dlerror());
+
+    std::string pkg = get_process_package_name();
+    if (pkg.empty()) {
+        LOGE("[PHOENIX:PROXY] Empty package name; cannot build files path");
+        return;
+    }
+
+    char files_path[640];
+    snprintf(files_path, sizeof(files_path), "/data/user/0/%s/files/libPHOENIX_orig.so",
+             pkg.c_str());
+
+    char apk_path[512] = {0};
+    if (!find_module_path("/base.apk", apk_path, sizeof(apk_path))) {
+        LOGE("[PHOENIX:PROXY] Cannot locate base.apk in /proc/self/maps");
+        return;
+    }
+
+    struct stat self_st;
+    bool have_self_size = (stat(self_path, &self_st) == 0);
+
+    const char* candidates[] = {
+        "lib/arm64-v8a/libPHOENIX_orig.so",
+        "lib/arm64-v8a/libPHOENIX.so",
+    };
+    for (const char* entry : candidates) {
+        if (!extract_apk_entry(apk_path, entry, files_path)) continue;
+
+        // Never dlopen our own binary again if it was left in the APK under
+        // the original name.
+        struct stat extracted_st;
+        if (have_self_size && stat(files_path, &extracted_st) == 0 &&
+            extracted_st.st_size == self_st.st_size) {
+            LOGW("[PHOENIX:PROXY] APK entry %s is the proxy itself; skipping", entry);
+            unlink(files_path);
+            continue;
+        }
+
+        handle = dlopen(files_path, RTLD_NOW);
+        if (handle) {
+            LOGI("[PHOENIX:PROXY] Loaded real libPHOENIX from APK entry %s", entry);
+            forward_jni_on_load(handle, vm);
+            return;
+        }
+        LOGW("[PHOENIX:PROXY] dlopen extracted %s failed: %s", files_path, dlerror());
+        unlink(files_path);
+    }
+
+    LOGE("[PHOENIX:PROXY] Could not load real libPHOENIX; continuing without it");
+}
+
 // IMPORTANT: no __attribute__((constructor)) here. Running the hooking engine
 // from the ELF constructor executes during the linker's call_constructors(),
 // before all C++ runtime globals are guaranteed usable and on an arbitrary
@@ -960,6 +1194,7 @@ static void init_engine() {
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     LOGI("[JNI] JNI_OnLoad called");
     init_engine();
+    load_real_phoenix(vm);
     return JNI_VERSION_1_6;
 }
 
