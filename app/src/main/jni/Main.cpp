@@ -165,6 +165,7 @@ static void* (*original_curl_easy_setopt)(void*, int, ...) = nullptr;
 static void* (*original_libdark_curl_easy_setopt)(void*, int, ...) = nullptr;
 // libDARK+0xe8734 parses the HTTP response body with nlohmann::json.
 static void* (*original_libdark_json_parse)(void*, int, void*) = nullptr;
+static void* (*original_libdark_parse)(void*, void*) = nullptr;
 static void* (*original_curl_easy_perform)(void*) = nullptr;
 static void  (*original_curl_easy_cleanup)(void*) = nullptr;
 static int   (*original_curl_url_set)(void*, int, const char*, unsigned int) = nullptr;
@@ -601,6 +602,10 @@ static const char LIBDARK_OLD_URL[] = "https://taitogaming.authapi.xyz/server";
 // mod can never reach that abort, even if the URL hook is installed a moment
 // too late for the request thread.
 static constexpr uintptr_t LIBDARK_JSON_PARSE_RVA = 0xe8734;
+// 0xeb378 is nlohmann::json::parse(owner, parser-state) called from 0xe87a8.
+// Second line of defence when a caller enters the parser through a path that
+// does not pass through the 0xe8734 entry point.
+static constexpr uintptr_t LIBDARK_PARSE_RVA = 0xeb378;
 static const char LIBDARK_FALLBACK_JSON[] =
     "{\"status\":false,\"reason\":\"INVALID PARAMETER\","
     "\"data\":{\"real\":\"\",\"token\":\"\",\"modname\":\"\","
@@ -621,13 +626,31 @@ static bool looks_like_json(const std::string& s) {
 
 static void* hooked_libdark_json_parse(void* owner, int flag, void* input) {
     std::string* body = static_cast<std::string*>(input);
-    if (body != nullptr && !looks_like_json(*body)) {
-        LOGI("[JSON:FIX] non-JSON auth response (%zu bytes, '%.96s') -> valid JSON",
-             body->size(), body->c_str());
-        *body = std::string(LIBDARK_FALLBACK_JSON);
+    if (body != nullptr) {
+        LOGI("[JSON:ENTER] body=%p size=%zu first='%.48s'",
+             body, body->size(), body->c_str());
+        if (!looks_like_json(*body)) {
+            LOGI("[JSON:FIX] non-JSON auth response (%zu bytes, '%.96s') -> valid JSON",
+                 body->size(), body->c_str());
+            *body = std::string(LIBDARK_FALLBACK_JSON);
+            LOGI("[JSON:FIX] now %zu bytes, first='%.48s'",
+                 body->size(), body->c_str());
+        }
+    } else {
+        LOGW("[JSON:ENTER] null body");
     }
     return original_libdark_json_parse ?
            original_libdark_json_parse(owner, flag, input) : nullptr;
+}
+
+static void* hooked_libdark_parse(void* owner, void* state) {
+    if (state != nullptr) {
+        uintptr_t* words = static_cast<uintptr_t*>(state);
+        LOGI("[PARSE:ENTER] state=%p words=%p %p %p %p", state,
+             reinterpret_cast<void*>(words[0]), reinterpret_cast<void*>(words[1]),
+             reinterpret_cast<void*>(words[2]), reinterpret_cast<void*>(words[3]));
+    }
+    return original_libdark_parse ? original_libdark_parse(owner, state) : nullptr;
 }
 
 static std::string get_library_path(const char* lib_name) {
@@ -722,6 +745,11 @@ static void install_libdark_rva_hooks() {
               reinterpret_cast<void*>(hooked_libdark_json_parse),
               reinterpret_cast<void**>(&original_libdark_json_parse),
               "libDARK json decode");
+
+    HookByRVA("libDARK.so", LIBDARK_PARSE_RVA,
+              reinterpret_cast<void*>(hooked_libdark_parse),
+              reinterpret_cast<void**>(&original_libdark_parse),
+              "libDARK nlohmann parse");
 }
 
 // Diagnostic: dump the first instruction words at the patched RVAs so the log
